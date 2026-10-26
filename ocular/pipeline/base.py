@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 import numpy as np
 
 
 class BaseSegmenter(ABC):
-    """Abstract base class for vision/element segmenters (e.g. Meta SAM 3.1)."""
+    """Abstract base class for vision/element segmenters (e.g. Meta SAM 3.1, OpenCV Heuristics)."""
 
     @abstractmethod
     def segment(
@@ -29,6 +29,19 @@ class BaseSegmenter(ABC):
           - metadata: dict
         """
         pass
+
+    def segment_batch(
+        self,
+        frames: List[np.ndarray],
+        frames_meta: Optional[List[Any]] = None,
+    ) -> Dict[int, List[Any]]:
+        """Segments a batch of frames, keyed by frame index."""
+        result: Dict[int, List[Any]] = {}
+        for idx, frame in enumerate(frames):
+            meta = frames_meta[idx] if frames_meta and idx < len(frames_meta) else None
+            meta_dict = meta.model_dump() if hasattr(meta, "model_dump") else {}
+            result[idx] = self.segment(frame, idx, meta_dict)
+        return result
 
 
 class BaseSynthesizer(ABC):
@@ -52,7 +65,7 @@ class BaseGenerator(ABC):
         self,
         dag: Dict[str, Any],
         segments: List[Dict[str, Any]],
-        out_dir: str | Path,
+        out_dir: Union[str, Path],
     ) -> Dict[str, Path]:
         """Emits executable automation driver and service wrapper to out_dir."""
         pass

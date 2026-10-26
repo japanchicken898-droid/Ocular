@@ -15,11 +15,14 @@ def test_emitted_fastapi_endpoints(tmp_path: Path):
     dist_dir = tmp_path / "emitted_dist"
     compile_command(input_path=str(video_path), out_dir=str(dist_dir))
 
+    assert (dist_dir / "app.py").exists()
+    assert (dist_dir / "playwright_driver.py").exists()
+
     sys.path.insert(0, str(dist_dir.resolve()))
     try:
         import importlib
-        main_mod = importlib.import_module("main")
-        app = main_mod.app
+        app_mod = importlib.import_module("app")
+        app = app_mod.app
 
         client = TestClient(app)
 
@@ -46,6 +49,24 @@ def test_emitted_fastapi_endpoints(tmp_path: Path):
         interval_data = res_interval.json()
         assert interval_data["success"] is True
         assert interval_data["data"]["interval"] == "15m"
+
+        # 4. Test POST /api/v1/execute with Pydantic payload validation
+        res_exec = client.post(
+            "/api/v1/execute",
+            json={
+                "parameters": {"interval": "15m"},
+                "viewport_width": 1920,
+                "viewport_height": 1080,
+                "headless": True,
+            },
+        )
+        assert res_exec.status_code == 200
+        assert "X-Ocular-Compile-Hash" in res_exec.headers
+        exec_data = res_exec.json()
+        assert exec_data["success"] is True
+        assert "execution_id" in exec_data
+        assert exec_data["steps_executed"] >= 1
+        assert "results" in exec_data
 
     finally:
         if str(dist_dir.resolve()) in sys.path:
