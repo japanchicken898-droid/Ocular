@@ -1,0 +1,103 @@
+{
+  "canvas_viewport": {
+    "reference_width": 1920,
+    "reference_height": 1080
+  },
+  "segments": [
+    {
+      "id": "chart_canvas",
+      "label": "chart_canvas",
+      "role": "canvas",
+      "bbox": {
+        "x": 0.05,
+        "y": 0.12,
+        "width": 0.90,
+        "height": 0.80
+      },
+      "confidence": 0.995,
+      "metadata": {
+        "tag": "canvas.tradingview-chart",
+        "interactive": true
+      }
+    },
+    {
+      "id": "interval_dropdown",
+      "label": "interval_dropdown",
+      "role": "button",
+      "bbox": {
+        "x": 0.12,
+        "y": 0.04,
+        "width": 0.06,
+        "height": 0.04
+      },
+      "confidence": 0.982,
+      "metadata": {
+        "tag": "div[data-role='interval-menu']",
+        "aria_label": "Time Interval Selector"
+      }
+    },
+    {
+      "id": "timeframe_15m",
+      "label": "timeframe_15m",
+      "role": "menuitem",
+      "bbox": {
+        "x": 0.12,
+        "y": 0.18,
+        "width": 0.08,
+        "height": 0.035
+      },
+      "confidence": 0.974,
+      "metadata": {
+        "value": "15m",
+        "text": "15 minutes"
+      }
+    },
+    {
+      "id": "timeframe_1h",
+      "label": "timeframe_1h",
+      "role": "menuitem",
+      "bbox": {
+        "x": 0.12,
+        "y": 0.22,
+        "width": 0.08,
+        "height": 0.035
+      },
+      "confidence": 0.968,
+      "metadata": {
+        "value": "1h",
+        "text": "1 hour"
+      }
+    },
+    {
+      "id": "timeframe_1d",
+      "label": "timeframe_1d",
+      "role": "menuitem",
+      "bbox": {
+        "x": 0.12,
+        "y": 0.26,
+        "width": 0.08,
+        "height": 0.035
+      },
+      "confidence": 0.971,
+      "metadata": {
+        "value": "1d",
+        "text": "1 day"
+      }
+    },
+    {
+      "id": "indicators_btn",
+      "label": "indicators_button",
+      "role": "button",
+      "bbox": {
+        "x": 0.20,
+        "y": 0.04,
+        "width": 0.07,
+        "height": 0.04
+      },
+      "confidence": 0.956,
+      "metadata": {
+        "tag": "button[data-name='indicators']"
+      }
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ocular"
+version = "0.1.0"
+description = "Ocular: Offline Visual Compiler moving multimodal vision inference from runtime to compile time"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Ocular Team" }
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["ocular"]
+
+dependencies = [
+    "rich>=13.7.0",
+    "pydantic>=2.5.0",
+    "jinja2>=3.1.2",
+    "opencv-python-headless>=4.8.0",
+    "numpy>=1.24.0",
+    "networkx>=3.1",
+    "playwright>=1.40.0",
+    "fastapi>=0.104.0",
+    "uvicorn>=0.24.0",
+    "typer>=0.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "httpx>=0.25.0",
+]
+
+[project.scripts]
+ocular = "ocular.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
