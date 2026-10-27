@@ -313,10 +313,10 @@ class OcularPlaywrightDriver:
 
         try:
             async with async_playwright() as p:
-                browser: Browser = await p.chromium.launch(
-                    headless=self.headless,
-                    slow_mo=self.slow_mo if not self.headless else 0,
-                )
+                if not self.headless:
+                    browser: Browser = await p.chromium.launch(headless=False, slow_mo=self.slow_mo)
+                else:
+                    browser: Browser = await p.chromium.launch(headless=True, slow_mo=0)
                 context = await browser.new_context(
                     viewport={"width": self.viewport_width, "height": self.viewport_height}
                 )
@@ -386,10 +386,10 @@ class OcularPlaywrightDriver:
 
         try:
             async with async_playwright() as p:
-                browser: Browser = await p.chromium.launch(
-                    headless=self.headless,
-                    slow_mo=self.slow_mo if not self.headless else 0,
-                )
+                if not self.headless:
+                    browser: Browser = await p.chromium.launch(headless=False, slow_mo=self.slow_mo)
+                else:
+                    browser: Browser = await p.chromium.launch(headless=True, slow_mo=0)
                 context = await browser.new_context(
                     viewport={"width": self.viewport_width, "height": self.viewport_height}
                 )
@@ -453,13 +453,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--headed",
         action="store_true",
-        help="Launch visible Chromium browser with slowed action steps for demonstration",
+        help="Launch interactive visible browser window",
     )
     parser.add_argument(
         "--slow-mo",
         type=int,
-        default=300,
-        help="Slowdown in milliseconds between action steps in headed mode (default: 300ms)",
+        default=120,
+        help="Slow down Playwright actions by milliseconds for video demo clarity",
     )
     parser.add_argument(
         "--base-url",
@@ -537,6 +537,7 @@ if __name__ == "__main__":
             table.add_column("Value / Status", style="cyan")
 
             table.add_row("Execution Strategy", strategy_text)
+            table.add_row("Browser Mode", "Visible (Headed)" if args.headed else "Headless (AOT Fast)")
             table.add_row("Target Anchor", f"[yellow]{target_anchor}[/yellow]")
             table.add_row("Selected Interval", f"[bold green]{interval}[/bold green]")
             table.add_row("End-to-End Latency", f"[bold green]{latency_ms:.2f} ms[/bold green]")
