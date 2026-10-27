@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Optional, Union
 from jinja2 import Environment, FileSystemLoader
 
@@ -13,6 +14,13 @@ from ocular.models.types import CompiledArtifacts, StateGraph
 from ocular.pipeline.base import BaseGenerator
 
 logger = logging.getLogger("ocular.pipeline.code_generator")
+
+
+def _sanitize_param_key(name: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", str(name).strip())
+    if not cleaned or cleaned[0].isdigit():
+        cleaned = f"param_{cleaned}"
+    return cleaned
 
 
 class JinjaCodeGenerator(BaseGenerator):
@@ -48,12 +56,14 @@ class JinjaCodeGenerator(BaseGenerator):
             action = e.get("action_type") or e.get("action")
             if action == "fill" or e.get("input_payload"):
                 target_id = e.get("trigger_element") or e.get("target_segment_id") or "field"
-                key = e.get("input_payload") or target_id.replace("input_", "").replace("field_", "")
+                raw_key = e.get("input_payload") or e.get("parameter_ref") or target_id
+                key = _sanitize_param_key(raw_key)
                 if key not in seen_keys:
                     seen_keys.add(key)
                     inputs.append(
                         {
                             "key": key,
+                            "parameter_ref": key,
                             "target_anchor": target_id,
                             "default_value": e.get("default_value", "sample_input"),
                             "label": e.get("target_label", key),
@@ -65,12 +75,14 @@ class JinjaCodeGenerator(BaseGenerator):
         # 2. Inspect segments for interactive input fields
         for s in segments:
             if isinstance(s, dict) and s.get("role") in ("input", "form"):
-                key = s.get("id", "input").replace("input_", "").replace("field_", "")
+                raw_key = s.get("id", "input")
+                key = _sanitize_param_key(raw_key)
                 if key not in seen_keys:
                     seen_keys.add(key)
                     inputs.append(
                         {
                             "key": key,
+                            "parameter_ref": key,
                             "target_anchor": s.get("id"),
                             "default_value": s.get("metadata", {}).get("value", "sample_input"),
                             "label": s.get("label", key),
@@ -84,6 +96,7 @@ class JinjaCodeGenerator(BaseGenerator):
             inputs.append(
                 {
                     "key": "interval",
+                    "parameter_ref": "interval",
                     "target_anchor": "interval_dropdown",
                     "default_value": "15m",
                     "label": "Timeframe Interval",
@@ -106,7 +119,27 @@ class JinjaCodeGenerator(BaseGenerator):
 
         compile_hash = self._compute_hash(dag, segments)
         input_fields = self._extract_dynamic_inputs(dag, segments)
+        for inp in input_fields:
+            if "parameter_ref" not in inp:
+                inp["parameter_ref"] = inp["key"]
         input_keys = [inp["key"] for inp in input_fields]
+
+        parameters_schema = dag.get("parameters_schema")
+        if not parameters_schema or not isinstance(parameters_schema, dict) or "properties" not in parameters_schema:
+            properties = {}
+            for inp in input_fields:
+                properties[inp["key"]] = {
+                    "type": "string",
+                    "default": inp["default_value"],
+                    "description": inp.get("label", f"{inp['key']} parameter"),
+                }
+            parameters_schema = {
+                "title": "WorkflowExecutionRequest",
+                "type": "object",
+                "properties": properties,
+                "required": list(properties.keys()),
+            }
+        dag["parameters_schema"] = parameters_schema
 
         context = {
             "dag": dag,
@@ -114,6 +147,7 @@ class JinjaCodeGenerator(BaseGenerator):
             "compile_hash": compile_hash,
             "input_fields": input_fields,
             "input_keys": input_keys,
+            "parameters_schema": parameters_schema,
         }
 
         # 1. Render playwright_driver.py
@@ -123,7 +157,8 @@ class JinjaCodeGenerator(BaseGenerator):
         driver_file.write_text(driver_code, encoding="utf-8")
 
         # 2. Render app.py (FastAPI microservice with /api/v1/execute)
-        app_tmpl = self.env.get_template("fastapi_app.py.j2")
+        tmpl_name = "app.py.j2" if (self.templates_dir / "app.py.j2").exists() else "fastapi_app.py.j2"
+        app_tmpl = self.env.get_template(tmpl_name)
         app_code = app_tmpl.render(context)
         app_file = out_path / "app.py"
         app_file.write_text(app_code, encoding="utf-8")
@@ -140,6 +175,7 @@ class JinjaCodeGenerator(BaseGenerator):
                     "dag": dag,
                     "compile_hash": compile_hash,
                     "input_fields": input_fields,
+                    "parameters_schema": parameters_schema,
                 },
                 indent=2,
             ),

@@ -13,10 +13,17 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Optional, Union
 import urllib.request
 import networkx as nx
 from rich.tree import Tree
+
+def _sanitize_param_key(name: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", str(name).strip())
+    if not cleaned or cleaned[0].isdigit():
+        cleaned = f"param_{cleaned}"
+    return cleaned
 
 try:
     from openai import OpenAI
@@ -48,6 +55,87 @@ class DAGBuilder(BaseSynthesizer):
         content = f"{label}:{':'.join(sorted(seg_ids))}"
         return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
 
+    def _synthesize_parameters_schema(
+        self,
+        nodes: Dict[str, Any],
+        edges: List[Dict[str, Any]],
+        segments: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Synthesizes dynamic parameters schema from input/fill events and workflow metadata."""
+        properties: Dict[str, Any] = {}
+        required: List[str] = []
+
+        # 1. TradingView or chart workflow interval
+        is_tv_or_chart = (
+            "TradingView" in self.workflow_name
+            or any("interval" in str(nid).lower() for nid in nodes)
+            or any("interval" in s.get("id", "").lower() for s in segments)
+        )
+        if is_tv_or_chart:
+            properties["interval"] = {
+                "type": "string",
+                "default": "15m",
+                "description": "Chart timeframe interval",
+            }
+            required.append("interval")
+
+        # 2. Extract from edges with action fill or input_payload
+        for e in edges:
+            action = str(e.get("action_type") or e.get("action", "")).lower()
+            if action in ("fill", "type") or e.get("input_payload"):
+                trigger = e.get("trigger_element") or "input"
+                raw_key = e.get("input_payload") or trigger
+                key = _sanitize_param_key(raw_key)
+                default_val = e.get("default_value", "sample_input")
+                if key not in properties:
+                    properties[key] = {
+                        "type": "string",
+                        "default": default_val,
+                        "description": f"Input value for {trigger}",
+                    }
+                    required.append(key)
+                e["parameter_ref"] = key
+
+        # 3. Extract from segments with input or form role
+        for s in segments:
+            if isinstance(s, dict) and s.get("role") in ("input", "form"):
+                sid = s.get("id", "input")
+                key = _sanitize_param_key(sid)
+                if key not in properties:
+                    properties[key] = {
+                        "type": "string",
+                        "default": s.get("metadata", {}).get("value", "sample_input"),
+                        "description": f"Dynamic input for {s.get('label', sid)}",
+                    }
+                    required.append(key)
+
+        # Fallback default if empty
+        if not properties:
+            properties["interval"] = {
+                "type": "string",
+                "default": "15m",
+                "description": "Chart timeframe interval",
+            }
+            required.append("interval")
+
+        # Map each dynamic step in DAG nodes to its corresponding parameter key
+        for nid, ndata in nodes.items():
+            nid_str = str(nid).lower()
+            if "interval" in nid_str or "timeframe" in nid_str:
+                ndata["parameter_ref"] = "interval"
+            else:
+                for pkey in properties:
+                    if pkey in nid_str:
+                        ndata["parameter_ref"] = pkey
+                        break
+
+        return {
+            "title": "WorkflowExecutionRequest",
+            "type": "object",
+            "properties": properties,
+            "required": required,
+        }
+
     def _call_muse_spark_api(
         self,
         segments: List[Dict[str, Any]],
@@ -78,11 +166,20 @@ class DAGBuilder(BaseSynthesizer):
                 "You are Meta Muse Spark, an expert state transition graph (DAG) synthesizer.\n"
                 "Given keyframe transition summaries and SAM bounding box manifests, synthesize a compact Directed Acyclic Graph (DAG) "
                 "representing state transitions, DAG topology, and dynamic variables.\n"
+                "Extract variable parameters from input, fill, and selection events into 'parameters_schema'.\n"
                 "Return ONLY a clean valid JSON object with the following schema:\n"
                 "{\n"
                 '  "workflow_name": "string",\n'
                 '  "root_node": "state_root",\n'
                 '  "terminal_node": "string",\n'
+                '  "parameters_schema": {\n'
+                '    "title": "WorkflowExecutionRequest",\n'
+                '    "type": "object",\n'
+                '    "properties": {\n'
+                '      "interval": {"type": "string", "default": "15m", "description": "Chart timeframe interval"}\n'
+                '    },\n'
+                '    "required": ["interval"]\n'
+                '  },\n'
                 '  "nodes": {\n'
                 '    "<node_id>": {\n'
                 '      "id": "<node_id>",\n'
@@ -91,6 +188,7 @@ class DAGBuilder(BaseSynthesizer):
                 '      "screen_name": "string",\n'
                 '      "screen_hash": "string",\n'
                 '      "url_pattern": "string",\n'
+                '      "parameter_ref": "string | null",\n'
                 '      "preconditions": [{"type": "string", "target_id": "string", "description": "string"}],\n'
                 '      "assertions": ["string"],\n'
                 '      "route": "string",\n'
@@ -104,6 +202,7 @@ class DAGBuilder(BaseSynthesizer):
                 '      "transition_label": "string",\n'
                 '      "trigger_element": "string",\n'
                 '      "action_type": "click" | "fill",\n'
+                '      "parameter_ref": "string | null",\n'
                 '      "target_selector": "string",\n'
                 '      "target_label": "string",\n'
                 '      "timeout_ms": 5000,\n'
@@ -268,10 +367,30 @@ class DAGBuilder(BaseSynthesizer):
                 if not terminal_node or terminal_node not in data["nodes"]:
                     terminal_node = topological_order[-1] if topological_order else root_node
 
+                params_schema = data.get("parameters_schema")
+                if not params_schema or not isinstance(params_schema, dict) or "properties" not in params_schema:
+                    params_schema = self._synthesize_parameters_schema(data["nodes"], data["edges"], segments)
+                else:
+                    if "title" not in params_schema:
+                        params_schema["title"] = "WorkflowExecutionRequest"
+                    if "type" not in params_schema:
+                        params_schema["type"] = "object"
+                    if "properties" not in params_schema:
+                        params_schema["properties"] = {}
+                    if "required" not in params_schema:
+                        params_schema["required"] = list(params_schema["properties"].keys())
+                    fallback_schema = self._synthesize_parameters_schema(data["nodes"], data["edges"], segments)
+                    for k, v in fallback_schema["properties"].items():
+                        if k not in params_schema["properties"]:
+                            params_schema["properties"][k] = v
+                            if k not in params_schema["required"]:
+                                params_schema["required"].append(k)
+
                 dag_result = {
                     "workflow_name": data.get("workflow_name", self.workflow_name),
                     "root_node": root_node,
                     "terminal_node": terminal_node,
+                    "parameters_schema": params_schema,
                     "nodes": data["nodes"],
                     "edges": data["edges"],
                     "topological_order": topological_order,
@@ -555,10 +674,13 @@ class DAGBuilder(BaseSynthesizer):
         root_node = topological_order[0] if topological_order else "state_root"
         terminal_node = topological_order[-1] if topological_order else root_node
 
+        parameters_schema = self._synthesize_parameters_schema(nodes, edges, segments)
+
         return {
             "workflow_name": self.workflow_name,
             "root_node": root_node,
             "terminal_node": terminal_node,
+            "parameters_schema": parameters_schema,
             "nodes": nodes,
             "edges": edges,
             "topological_order": topological_order,
@@ -621,6 +743,7 @@ class DAGBuilder(BaseSynthesizer):
                 keyframe_index=0,
                 url_pattern=ndata.get("url_pattern"),
                 assertions=ndata.get("assertions", []),
+                parameter_ref=ndata.get("parameter_ref"),
             )
 
         typed_edges: List[DAGEdge] = []
@@ -640,6 +763,7 @@ class DAGBuilder(BaseSynthesizer):
                     target_segment_id=e.get("trigger_element"),
                     target_selector=e.get("target_selector", f"#{e.get('trigger_element')}"),
                     target_label=e.get("target_label"),
+                    parameter_ref=e.get("parameter_ref"),
                     timeout_ms=e.get("timeout_ms", 5000),
                     wait_condition=e.get("wait_condition"),
                     description=e.get("description"),
@@ -652,6 +776,7 @@ class DAGBuilder(BaseSynthesizer):
             terminal_node_ids=[dag_dict["terminal_node"]],
             nodes=typed_nodes,
             edges=typed_edges,
+            parameters_schema=dag_dict.get("parameters_schema"),
         )
 
 

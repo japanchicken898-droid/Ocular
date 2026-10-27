@@ -32,6 +32,7 @@ class OcularPlaywrightDriver:
         "{{ seg.id }}": {
             "label": "{{ seg.label }}",
             "role": "{{ seg.role }}",
+            "suggested_selector": "{{ seg.suggested_selector or '' }}",
             "bbox": {
                 "x": {{ seg.bbox.x }},
                 "y": {{ seg.bbox.y }},
@@ -42,6 +43,21 @@ class OcularPlaywrightDriver:
         {% endfor %}
     }
 
+    ROLE_MAPPING = {
+        "button": "button",
+        "menuitem": "menuitem",
+        "input": "textbox",
+        "textbox": "textbox",
+        "dropdown": "combobox",
+        "combobox": "combobox",
+        "checkbox": "checkbox",
+        "radio": "radio",
+        "link": "link",
+        "tab": "tab",
+        "dialog": "dialog",
+        "heading": "heading",
+    }
+
     # Parameterized dynamic input fields
     INPUT_FIELDS = {
         {% for inp in input_fields %}
@@ -50,6 +66,7 @@ class OcularPlaywrightDriver:
             "default_value": "{{ inp.default_value }}",
             "label": "{{ inp.label }}",
             "action": "{{ inp.action }}",
+            "selector": "{{ inp.selector or '' }}",
         },
         {% endfor %}
     }
@@ -63,6 +80,7 @@ class OcularPlaywrightDriver:
         slow_mo: int = 0,
         max_retries: int = 3,
         retry_delay_sec: float = 0.15,
+        semantic_timeout_ms: int = 1200,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.viewport_width = viewport_width
@@ -71,6 +89,7 @@ class OcularPlaywrightDriver:
         self.slow_mo = slow_mo
         self.max_retries = max_retries
         self.retry_delay_sec = retry_delay_sec
+        self.semantic_timeout_ms = semantic_timeout_ms
 
     def denormalize_target(self, anchor_id: str) -> Tuple[float, float]:
         """Translates scale-invariant coordinates (0.0 -> 1.0) to exact browser pixel coordinates."""
@@ -101,6 +120,7 @@ class OcularPlaywrightDriver:
                     "anchor": anchor_id,
                     "attempt": attempt,
                     "pixel_coordinates": {"x": px, "y": py},
+                    "strategy": "sam_visual_coordinates",
                     "success": True,
                 }
             except Exception as exc:
@@ -113,17 +133,143 @@ class OcularPlaywrightDriver:
             f"Failed to click anchor '{anchor_id}' after {self.max_retries} attempts: {last_error}"
         )
 
-    async def click_canvas_target(self, page: Page, anchor_id: str) -> Dict[str, Any]:
-        """Clicks a visual target on screen using scale-invariant translation with retry."""
+    async def click_target(self, page: Page, anchor_id: str) -> Dict[str, Any]:
+        """Hybrid resilient click:
+
+        Primary execution targets semantic accessibility roles and ARIA locators.
+        Seamlessly falls back to Meta SAM 3.1 visual coordinates if DOM elements
+        are canvas-rendered, obfuscated, or detached.
+        """
+        anchor = self.ANCHORS.get(anchor_id)
+        if not anchor:
+            raise KeyError(f"Visual anchor '{anchor_id}' not found in compiled registry")
+
+        role = str(anchor.get("role", "")).lower()
+        aria_role = self.ROLE_MAPPING.get(role, role if role in ("button", "menuitem", "link", "tab") else None)
+        label = anchor.get("label", "")
+        selector = anchor.get("suggested_selector", "")
+
+        # 1. Primary Attempt: Semantic Accessibility Roles
+        try:
+            locator = None
+            clean_label = label.replace("_", " ").strip() if label else ""
+
+            if aria_role:
+                try:
+                    loc = page.get_by_role(aria_role, name=clean_label)
+                    if await loc.count() > 0:
+                        locator = loc
+                except Exception:
+                    pass
+
+            # Try selector if ARIA locator didn't resolve
+            if locator is None and selector:
+                try:
+                    loc = page.locator(selector)
+                    if await loc.count() > 0:
+                        locator = loc
+                except Exception:
+                    pass
+
+            # Try id-based locator fallback
+            if locator is None:
+                try:
+                    loc = page.locator(f"#{anchor_id}, button#{anchor_id}, [data-role='{anchor_id}']")
+                    if await loc.count() > 0:
+                        locator = loc
+                except Exception:
+                    pass
+
+            if locator is not None and await locator.count() > 0:
+                target_elem = locator.first
+                await target_elem.wait_for(state="visible", timeout=self.semantic_timeout_ms)
+                await target_elem.click(timeout=self.semantic_timeout_ms)
+                logger.info(f"Primary semantic accessibility click succeeded for '{anchor_id}' (role={aria_role})")
+                return {
+                    "anchor": anchor_id,
+                    "strategy": "semantic_accessibility",
+                    "role": aria_role or role,
+                    "label": label,
+                    "success": True,
+                }
+        except Exception as sem_exc:
+            logger.debug(
+                f"Semantic accessibility target failed for '{anchor_id}' ({sem_exc}); "
+                "seamlessly falling back to Meta SAM 3.1 visual coordinates."
+            )
+
+        # 2. Resilient Fallback: Meta SAM 3.1 Visual Coordinates
+        logger.info(f"Executing Meta SAM 3.1 visual coordinate fallback for '{anchor_id}'")
         px, py = self.denormalize_target(anchor_id)
-        return await self.click_with_retry(page, px, py, anchor_id)
+        res = await self.click_with_retry(page, px, py, anchor_id)
+        res["strategy"] = "sam_visual_coordinates"
+        return res
+
+    async def click_canvas_target(self, page: Page, anchor_id: str) -> Dict[str, Any]:
+        """Clicks target using hybrid resilient strategy (semantic accessibility -> SAM 3.1 visual coordinates)."""
+        return await self.click_target(page, anchor_id)
 
     async def fill_target(self, page: Page, anchor_id: str, value: str) -> Dict[str, Any]:
-        """Clicks input field and deterministically types parameterized form payload."""
+        """Hybrid resilient form filling:
+
+        Primary execution targets semantic textbox/input accessibility roles.
+        Seamlessly falls back to Meta SAM 3.1 visual coordinates and keyboard injection
+        if DOM elements are canvas-rendered or obfuscated.
+        """
+        anchor = self.ANCHORS.get(anchor_id, {})
+        label = anchor.get("label", anchor_id)
+        selector = anchor.get("suggested_selector", "")
+
+        # 1. Primary Attempt: Semantic Accessibility Roles
+        try:
+            clean_label = label.replace("_", " ").strip() if label else ""
+            locator = None
+            try:
+                loc = page.get_by_role("textbox", name=clean_label)
+                if await loc.count() > 0:
+                    locator = loc
+            except Exception:
+                pass
+
+            if locator is None and selector:
+                try:
+                    loc = page.locator(selector)
+                    if await loc.count() > 0:
+                        locator = loc
+                except Exception:
+                    pass
+
+            if locator is None:
+                try:
+                    loc = page.locator(f"input#{anchor_id}, textarea#{anchor_id}, #{anchor_id}")
+                    if await loc.count() > 0:
+                        locator = loc
+                except Exception:
+                    pass
+
+            if locator is not None and await locator.count() > 0:
+                target_elem = locator.first
+                await target_elem.wait_for(state="visible", timeout=self.semantic_timeout_ms)
+                await target_elem.fill(str(value), timeout=self.semantic_timeout_ms)
+                logger.info(f"Primary semantic accessibility fill succeeded for '{anchor_id}'")
+                return {
+                    "anchor": anchor_id,
+                    "action": "fill",
+                    "value": str(value),
+                    "strategy": "semantic_accessibility",
+                    "success": True,
+                }
+        except Exception as sem_exc:
+            logger.debug(
+                f"Semantic accessibility fill failed for '{anchor_id}' ({sem_exc}); "
+                "seamlessly falling back to Meta SAM 3.1 visual coordinates."
+            )
+
+        # 2. Resilient Fallback: Meta SAM 3.1 Visual Coordinates + Keyboard
+        logger.info(f"Executing Meta SAM 3.1 visual coordinate fill fallback for '{anchor_id}'")
         px, py = self.denormalize_target(anchor_id)
-        click_res = await self.click_with_retry(page, px, py, anchor_id)
+        await self.click_with_retry(page, px, py, anchor_id)
         await asyncio.sleep(0.05)
-        # Clear field and type text
         await page.keyboard.press("Meta+A")
         await page.keyboard.press("Backspace")
         await page.keyboard.type(str(value), delay=15)
@@ -132,6 +278,7 @@ class OcularPlaywrightDriver:
             "action": "fill",
             "value": str(value),
             "pixel_coordinates": {"x": px, "y": py},
+            "strategy": "sam_visual_coordinates",
             "success": True,
         }
 
@@ -143,20 +290,26 @@ class OcularPlaywrightDriver:
         bbox = anchor["bbox"]
         return 0.0 <= bbox["x"] <= 1.0 and 0.0 <= bbox["y"] <= 1.0
 
+    async def run(self, parameters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Runs the compiled workflow with dynamic argument injection."""
+        return await self.execute_workflow(params=parameters)
+
     async def execute_workflow(self, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Executes the pre-compiled workflow DAG deterministically with dynamic parameters."""
-        params = params or {}
+        parameters = params or {}
         t_start = time.perf_counter()
         steps_executed = []
 
         # Check for TradingView interval shortcut
-        if "interval" in params and "interval_dropdown" in self.ANCHORS:
-            return await self.set_interval(interval=params["interval"])
+        if "interval_dropdown" in self.ANCHORS and ("interval" in parameters or "interval" in self.INPUT_FIELDS):
+            interval_val = parameters.get("interval") or self.INPUT_FIELDS.get("interval", {}).get("default_value", "15m")
+            return await self.set_interval(interval=str(interval_val))
 
         # Determine dynamic form field inputs
         active_inputs = {}
         for k, info in self.INPUT_FIELDS.items():
-            active_inputs[k] = params.get(k, info.get("default_value", ""))
+            param_ref = info.get("parameter_ref", k)
+            active_inputs[param_ref] = parameters.get(param_ref, info.get("default_value", ""))
 
         try:
             async with async_playwright() as p:
@@ -172,13 +325,14 @@ class OcularPlaywrightDriver:
                 # Step 0: Navigate to initial screen
                 await page.goto(self.base_url, timeout=3000, wait_until="domcontentloaded")
 
-                # Step 1+: Execute dynamic form inputs or synthesized DAG edges
+                # Step 1+: Execute dynamic form inputs with dynamic argument injection
                 {% for inp in input_fields %}
+                {% set step = inp %}
                 {% if inp.key != 'interval' %}
-                val = active_inputs.get("{{ inp.key }}", "{{ inp.default_value }}")
+                val = parameters.get("{{ step.parameter_ref }}", "{{ step.default_value }}")
                 if "{{ inp.target_anchor }}" in self.ANCHORS:
-                    step = await self.fill_target(page, "{{ inp.target_anchor }}", val)
-                    steps_executed.append(step)
+                    step_res = await self.fill_target(page, "{{ inp.target_anchor }}", val)
+                    steps_executed.append(step_res)
                 {% endif %}
                 {% endfor %}
 
@@ -198,12 +352,14 @@ class OcularPlaywrightDriver:
             logger.debug(f"Live browser bypassed ({e}), returning compile-time translated coordinates")
             for k, info in self.INPUT_FIELDS.items():
                 anchor = info.get("target_anchor")
-                val = active_inputs.get(k, info.get("default_value", ""))
+                param_ref = info.get("parameter_ref", k)
+                val = parameters.get(param_ref, info.get("default_value", ""))
                 if anchor and anchor in self.ANCHORS:
                     px, py = self.denormalize_target(anchor)
                     steps_executed.append({
                         "anchor": anchor,
                         "action": info.get("action", "click"),
+                        "parameter_ref": param_ref,
                         "value": str(val) if info.get("action") == "fill" else None,
                         "pixel_coordinates": {"x": px, "y": py},
                         "success": True,
@@ -281,6 +437,14 @@ class OcularPlaywrightDriver:
             }
 
 
+async def run(parameters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Top-level entrypoint supporting dynamic argument injection:
+    val = parameters.get(step.parameter_ref, step.default_value)
+    """
+    driver = OcularPlaywrightDriver()
+    return await driver.run(parameters=parameters)
+
+
 if __name__ == "__main__":
     import argparse
     import json
@@ -313,7 +477,12 @@ if __name__ == "__main__":
         "--params",
         type=str,
         default="{}",
-        help="JSON string with custom dynamic workflow parameters",
+        help="JSON string with custom dynamic workflow parameters (e.g. '{\"interval\": \"1h\"}')",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit raw JSON execution telemetry output",
     )
     args = parser.parse_args()
 
@@ -330,5 +499,54 @@ if __name__ == "__main__":
         headless=not args.headed,
         slow_mo=args.slow_mo if args.headed else 0,
     )
-    result = asyncio.run(driver.execute_workflow(payload))
-    print("Execution Result:", result)
+    result = asyncio.run(driver.run(payload))
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        try:
+            from rich import box
+            from rich.console import Console
+            from rich.table import Table
+
+            console = Console()
+            strategies = [s.get("strategy") for s in result.get("steps", []) if s.get("strategy")]
+            if "semantic_accessibility" in strategies and "sam_visual_coordinates" in strategies:
+                strategy_text = "[yellow]Hybrid (Semantic Primary -> SAM Fallback)[/yellow]"
+            elif "semantic_accessibility" in strategies:
+                strategy_text = "[bold green]Semantic Accessibility (Roles / Locators)[/bold green]"
+            else:
+                strategy_text = "[bold cyan]Meta SAM 3.1 Visual Coordinates[/bold cyan]"
+
+            target_anchor = result.get("target_anchor")
+            if not target_anchor and result.get("steps"):
+                target_anchor = result["steps"][-1].get("anchor") or result["steps"][0].get("anchor")
+            target_anchor = target_anchor or "N/A"
+
+            interval = result.get("interval") or result.get("parameters", {}).get("interval", "N/A")
+            latency_ms = result.get("latency_ms", 0.0)
+            compile_hash = result.get("compile_hash", "N/A")
+
+            table = Table(
+                box=box.ROUNDED,
+                title="[bold cyan]Ocular Driver Execution Telemetry[/bold cyan]",
+                header_style="bold magenta",
+                show_header=True,
+            )
+            table.add_column("Telemetry Metric", style="bold white", width=26)
+            table.add_column("Value / Status", style="cyan")
+
+            table.add_row("Execution Strategy", strategy_text)
+            table.add_row("Target Anchor", f"[yellow]{target_anchor}[/yellow]")
+            table.add_row("Selected Interval", f"[bold green]{interval}[/bold green]")
+            table.add_row("End-to-End Latency", f"[bold green]{latency_ms:.2f} ms[/bold green]")
+            table.add_row("Runtime Inference Cost", "[bold green]$0.00 (Zero Runtime Vision)[/bold green]")
+            table.add_row("Compile Hash", f"[dim]{compile_hash}[/dim]")
+            table.add_row(
+                "Execution Status",
+                "[bold green]✓ SUCCESS[/bold green]" if result.get("status") == "success" else "[bold red]FAILED[/bold red]",
+            )
+
+            console.print(table)
+        except Exception:
+            print(json.dumps(result, indent=2))

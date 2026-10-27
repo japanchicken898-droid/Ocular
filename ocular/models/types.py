@@ -100,6 +100,7 @@ class DAGNode(BaseModel):
     url_pattern: Optional[str] = Field(default=None, description="Expected URL or route")
     segments: List[VisualSegment] = Field(default_factory=list, description="Visual segments on this screen")
     assertions: List[str] = Field(default_factory=list, description="State invariants / assertions")
+    parameter_ref: Optional[str] = Field(default=None, description="Dynamic parameter key binding (e.g. interval)")
 
 
 class DAGEdge(BaseModel):
@@ -110,6 +111,7 @@ class DAGEdge(BaseModel):
     target_selector: str = Field(..., description="Playwright selector to trigger transition")
     target_label: Optional[str] = None
     input_payload: Optional[str] = None
+    parameter_ref: Optional[str] = Field(default=None, description="Dynamic parameter key binding")
     wait_condition: Optional[str] = Field(default=None, description="Wait selector or network idle")
     timeout_ms: int = Field(default=5000)
     description: Optional[str] = None
@@ -121,6 +123,9 @@ class StateGraph(BaseModel):
     terminal_node_ids: List[str] = Field(default_factory=list)
     nodes: Dict[str, DAGNode] = Field(default_factory=dict)
     edges: List[DAGEdge] = Field(default_factory=list)
+    parameters_schema: Optional[Dict[str, Any]] = Field(
+        default=None, description="Synthesized parameters schema (JSON schema)"
+    )
 
     def get_linear_path(self) -> List[DAGEdge]:
         """Returns the primary execution path for code generation."""

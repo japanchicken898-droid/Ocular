@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from fastapi import FastAPI, HTTPException, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -43,14 +43,24 @@ app.add_middleware(
 driver = OcularPlaywrightDriver()
 
 
+class ExecutionPayload(BaseModel):
+    """Dynamically synthesized parameter payload model from DAG parameters_schema."""
+    {% if parameters_schema and parameters_schema.properties %}
+    {% for prop_name, prop_meta in parameters_schema.properties.items() %}
+    {{ prop_name }}: str = Field(
+        default={{ prop_meta.default | tojson if prop_meta.default is defined else "''" }},
+        description={{ prop_meta.description | tojson if prop_meta.description is defined else "''" }}
+    )
+    {% endfor %}
+    {% else %}
+    interval: str = Field(default="15m", description="Chart timeframe interval")
+    {% endif %}
+
+
 class ExecuteWorkflowRequest(BaseModel):
     workflow_name: Optional[str] = Field(default=WORKFLOW_NAME, description="Target workflow name")
-    parameters: Dict[str, Any] = Field(
-        default_factory=lambda: {
-            {% for inp in input_fields %}
-            "{{ inp.key }}": "{{ inp.default_value }}",
-            {% endfor %}
-        },
+    parameters: Optional[Dict[str, Any]] = Field(
+        default_factory=lambda: ExecutionPayload().model_dump(),
         description="Dynamic form parameters: {{ input_keys | join(', ') }}"
     )
     base_url: Optional[str] = Field(default="http://localhost:3000", description="Application root URL")
@@ -93,6 +103,7 @@ async def get_parameters_schema() -> Dict[str, Any]:
     return {
         "workflow": WORKFLOW_NAME,
         "compile_hash": COMPILE_HASH,
+        "parameters_schema": ExecutionPayload.model_json_schema(),
         "input_parameters": driver.INPUT_FIELDS,
         "anchors_count": len(driver.ANCHORS),
         "zero_runtime_vision": True,
@@ -100,21 +111,31 @@ async def get_parameters_schema() -> Dict[str, Any]:
 
 
 @app.post("/api/v1/execute", response_model=ExecuteWorkflowResponse, tags=["Execution"])
-async def execute_workflow(payload: ExecuteWorkflowRequest, response: Response) -> ExecuteWorkflowResponse:
-    """Executes the compiled workflow deterministically with Pydantic payload validation."""
+async def execute_workflow(
+    payload: Union[ExecuteWorkflowRequest, ExecutionPayload],
+    response: Response
+) -> ExecuteWorkflowResponse:
+    """Executes the compiled workflow deterministically with dynamic parameter binding."""
     t0 = time.perf_counter()
     execution_id = f"exec_{uuid.uuid4().hex[:12]}"
 
-    if payload.viewport_width and payload.viewport_height:
-        driver.viewport_width = payload.viewport_width
-        driver.viewport_height = payload.viewport_height
-    if payload.base_url:
-        driver.base_url = payload.base_url.rstrip("/")
-    driver.headless = payload.headless
+    if isinstance(payload, ExecuteWorkflowRequest):
+        if payload.viewport_width and payload.viewport_height:
+            driver.viewport_width = payload.viewport_width
+            driver.viewport_height = payload.viewport_height
+        if payload.base_url:
+            driver.base_url = payload.base_url.rstrip("/")
+        driver.headless = payload.headless
+        raw_params = payload.parameters if payload.parameters is not None else {}
+        typed_payload = ExecutionPayload(**raw_params)
+    elif isinstance(payload, ExecutionPayload):
+        typed_payload = payload
+    else:
+        typed_payload = ExecutionPayload()
 
     try:
-        # Pass dynamic parameters to the compiled driver
-        result = await driver.execute_workflow(params=payload.parameters)
+        # Bind the typed payload directly to the driver execution call
+        result = await driver.execute_workflow(params=typed_payload.model_dump())
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
 
         response.headers["X-Ocular-Compile-Hash"] = COMPILE_HASH

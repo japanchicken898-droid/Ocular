@@ -14,8 +14,12 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional
+from rich import box
+from rich.align import Align
 from rich.console import Console
 from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
 import typer
 
 from ocular.pipeline.code_generator import JinjaCodeGenerator
@@ -26,12 +30,44 @@ from ocular.pipeline.video_ingest import VideoIngestSampler
 console = Console()
 logger = logging.getLogger("ocular.cli")
 
+# Submodule alias for architectural interoperability
+sys.modules["ocular.cli.compiler"] = sys.modules[__name__]
+setattr(sys.modules[__name__], "compiler", sys.modules[__name__])
+
 app = typer.Typer(
     name="ocular",
     help="Ocular: Offline Visual Compiler moving multimodal vision inference from runtime to compile time.",
     no_args_is_help=True,
     add_completion=False,
 )
+
+
+def print_banner(console_instance: Optional[Console] = None) -> None:
+    """Renders the stylized ASCII banner with subtitle and version badge."""
+    c = console_instance or console
+    ascii_art = (
+        r"   ____   ____ _   _ _        _    ____  " + "\n"
+        r"  / __ \ / ___| | | | |      / \  |  _ \ " + "\n"
+        r" | |  | | |   | | | | |     / _ \ | |_) |" + "\n"
+        r" | |__| | |___| |_| | |___ / ___ \|  _ < " + "\n"
+        r"  \____/ \____|\___/|_____/_/   \_\_| \_\""
+    )
+    banner_text = Text()
+    banner_text.append(ascii_art + "\n\n", style="bold cyan")
+    banner_text.append(
+        "Offline Visual Workflow Compiler • Meta SAM 3.1 + Meta Muse Spark\n",
+        style="bold white",
+    )
+    banner_text.append("Version: ", style="dim white")
+    banner_text.append("v0.1.0-mvp", style="bold green")
+
+    banner_panel = Panel(
+        Align.center(banner_text),
+        box=box.ROUNDED,
+        border_style="cyan",
+        padding=(1, 2),
+    )
+    c.print(banner_panel)
 
 
 def compile_command(
@@ -44,12 +80,15 @@ def compile_command(
     video_file = Path(input_path)
     output_path = Path(out_dir)
 
+    print_banner(console)
+
     console.print(
         Panel(
-            f"[bold cyan]Ocular Offline Visual Compiler[/bold cyan]\n"
+            f"[bold cyan]Compilation Job Manifest[/bold cyan]\n"
             f"[dim]Compiling visual recording into deterministic Playwright + FastAPI service[/dim]\n"
             f"Input Recording : [yellow]{input_path}[/yellow]\n"
             f"Output Directory: [yellow]{out_dir}[/yellow]",
+            box=box.ROUNDED,
             border_style="cyan",
         )
     )
@@ -76,10 +115,14 @@ def compile_command(
     # 2. Meta SAM 3.1 Segmentation Stage
     console.print("[bold green][+][/bold green] [bold]Stage 2: Meta SAM 3.1 Visual Segmentation[/bold]")
     try:
-        segmenter = MetaSAMSegmenter(fallback_segmenter=MockSAMSegmenter())
-        # Segment keyframe or fallback
-        sample_frame = raw_frames[0] if raw_frames else None
-        segments = segmenter.segment(sample_frame)
+        with console.status(
+            "[bold cyan]Calling Meta SAM 3.1 API (api.meta.ai)...[/bold cyan]",
+            spinner="dots",
+        ):
+            segmenter = MetaSAMSegmenter(fallback_segmenter=MockSAMSegmenter())
+            sample_frame = raw_frames[0] if raw_frames else None
+            segments = segmenter.segment(sample_frame)
+
         if getattr(segmenter, "last_inference_source", None) == "meta_sam_3.1_api" or os.environ.get("META_MODEL_API_KEY"):
             console.print("    [green]✓[/green] Live Meta SAM 3.1 inference executed (POST https://api.meta.ai/v1/responses)")
         console.print(
@@ -105,8 +148,13 @@ def compile_command(
     # 3. Muse Spark DAG Synthesis Stage
     console.print("[bold green][+][/bold green] [bold]Stage 3: Muse Spark State Graph Synthesis[/bold]")
     try:
-        builder = DAGBuilder(workflow_name=workflow_name)
-        dag = builder.build_dag(segments, transitions)
+        with console.status(
+            "[bold cyan]Synthesizing state DAG via Meta Muse Spark (Baseten)...[/bold cyan]",
+            spinner="dots",
+        ):
+            builder = DAGBuilder(workflow_name=workflow_name)
+            dag = builder.build_dag(segments, transitions)
+
         if getattr(builder, "last_inference_source", None) == "live_baseten_muse_spark" or os.environ.get("BASETEN_API_KEY"):
             console.print("    [green]✓[/green] Live Baseten Meta Muse Spark inference executed (model: meta-models/muse-spark-open-1026)")
         console.print(
@@ -129,18 +177,60 @@ def compile_command(
         console.print(f"    [green]✓[/green] Emitted: [yellow]{artifacts['main'].name}[/yellow]")
         console.print(f"    [green]✓[/green] Emitted: [yellow]{artifacts['state_graph'].name}[/yellow]")
         console.print(f"    [green]✓[/green] Emitted: [yellow]{artifacts['workflow_dag_mermaid'].name}[/yellow]")
+
+        # Print extracted parameters table if parameters_schema is present
+        params_schema = dag.get("parameters_schema", {})
+        properties = params_schema.get("properties", {})
+        if properties:
+            table = Table(
+                title="[bold cyan]Synthesized Workflow Parameters Schema[/bold cyan]",
+                box=box.ROUNDED,
+                header_style="bold magenta",
+            )
+            table.add_column("Parameter", style="bold cyan")
+            table.add_column("Type", style="yellow")
+            table.add_column("Default", style="green")
+            table.add_column("Target Anchor", style="blue")
+            table.add_column("Description", style="white")
+
+            for param_name, prop_meta in properties.items():
+                param_type = prop_meta.get("type", "string")
+                param_default = str(prop_meta.get("default", ""))
+                param_desc = prop_meta.get("description", "")
+                target_anchor = (
+                    "interval_dropdown"
+                    if param_name == "interval"
+                    else f"#{param_name}"
+                )
+                table.add_row(param_name, param_type, param_default, target_anchor, param_desc)
+
+            console.print(table)
     except Exception as exc:
         console.print(f"[bold red][!] Code generation failed:[/bold red] {exc}")
         return 1
 
     duration = time.perf_counter() - t_start
+    cli_cmd = f"python {out_dir}/playwright_driver.py --params '{{\"interval\": \"1h\"}}'"
+    api_cmd = "uvicorn dist.main:app --reload"
+    docs_url = "http://127.0.0.1:8000/docs"
+
+    completion_content = (
+        f"[bold green]✓ Compilation Successful in {duration:.2f}s[/bold green]\n\n"
+        f"[bold white]Output Directory:[/bold white] [cyan]{output_path.resolve()}[/cyan]\n\n"
+        f"[bold cyan]▶ CLI Execution Command:[/bold cyan]\n"
+        f"  [yellow]{cli_cmd}[/yellow]\n\n"
+        f"[bold cyan]▶ Microservice Startup Command:[/bold cyan]\n"
+        f"  [yellow]{api_cmd}[/yellow]\n\n"
+        f"[bold cyan]▶ Interactive Swagger UI Documentation:[/bold cyan]\n"
+        f"  [link={docs_url}]{docs_url}[/link]"
+    )
     console.print(
         Panel(
-            f"[bold green]✓ Compilation Successful in {duration:.2f}s[/bold green]\n"
-            f"Output artifacts written to: [cyan]{output_path.resolve()}[/cyan]\n"
-            f"FastAPI microservice entry : [dim]uvicorn main:app --reload[/dim]\n"
-            f"Playwright driver script   : [dim]python playwright_driver.py[/dim]",
+            completion_content,
+            title="[bold green]Ocular Build Complete[/bold green]",
+            box=box.ROUNDED,
             border_style="green",
+            padding=(1, 2),
         )
     )
     return 0
@@ -171,6 +261,29 @@ def compile_cli(
     exit_code = compile_command(input_path=input, out_dir=out_dir, workflow_name=workflow_name)
     if exit_code != 0:
         raise typer.Exit(code=exit_code)
+
+
+@app.command("execute")
+def execute_cli(
+    dist_dir: str = typer.Option("./dist", "--dist-dir", "-d", help="Directory containing compiled driver"),
+    params: str = typer.Option("{}", "--params", "-p", help="JSON string of dynamic workflow parameters"),
+    base_url: str = typer.Option("http://localhost:3000", "--base-url", "-u", help="Target URL"),
+    headed: bool = typer.Option(False, "--headed", help="Run headed browser"),
+) -> None:
+    """Execute the compiled workflow driver with dynamic parameters."""
+    print_banner(console)
+    driver_script = Path(dist_dir) / "playwright_driver.py"
+    if not driver_script.exists():
+        console.print(f"[bold red][!] Compiled driver not found at {driver_script}[/bold red]")
+        raise typer.Exit(code=1)
+
+    import subprocess
+    cmd = [sys.executable, str(driver_script), "--params", params, "--base-url", base_url]
+    if headed:
+        cmd.append("--headed")
+    proc = subprocess.run(cmd)
+    if proc.returncode != 0:
+        raise typer.Exit(code=proc.returncode)
 
 
 @app.command("benchmark")
