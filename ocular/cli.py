@@ -285,19 +285,6 @@ def execute_cli(
     if proc.returncode != 0:
         raise typer.Exit(code=proc.returncode)
 
-
-@app.command("benchmark")
-def benchmark_cli(
-    iterations: int = typer.Option(5, "--iterations", "-n", help="Number of benchmark iterations"),
-    dist_dir: str = typer.Option("./dist", "--dist-dir", "-d", help="Dist directory containing compiled artifacts"),
-    out_file: str = typer.Option("./dist/benchmark_results.json", "--out-file", "-o", help="Benchmark output report path"),
-) -> None:
-    """Run side-by-side performance benchmark: Ocular compiled driver vs. Runtime VLM."""
-    import asyncio
-    from benchmark import run_benchmark_suite
-    asyncio.run(run_benchmark_suite(iterations=iterations, dist_dir=dist_dir, output_report=out_file))
-
-
 @app.command("version")
 def version_cli() -> None:
     """Show Ocular compiler version."""
