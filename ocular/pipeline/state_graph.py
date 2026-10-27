@@ -61,11 +61,11 @@ class DAGBuilder(BaseSynthesizer):
         edges: List[Dict[str, Any]],
         segments: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        """Synthesizes dynamic parameters schema from input/fill events and workflow metadata."""
+        """Synthesizes dynamic parameters schema for elements actually referenced by executed action steps."""
         properties: Dict[str, Any] = {}
         required: List[str] = []
 
-        # 1. TradingView or chart workflow interval
+        # 1. TradingView or chart workflow interval override
         is_tv_or_chart = (
             "TradingView" in self.workflow_name
             or any("interval" in str(nid).lower() for nid in nodes)
@@ -79,7 +79,7 @@ class DAGBuilder(BaseSynthesizer):
             }
             required.append("interval")
 
-        # 2. Extract from edges with action fill or input_payload
+        # 2. Only register parameters for elements actually referenced by executed action steps (e.g. fill, type)
         for e in edges:
             action = str(e.get("action_type") or e.get("action", "")).lower()
             if action in ("fill", "type") or e.get("input_payload"):
@@ -95,19 +95,6 @@ class DAGBuilder(BaseSynthesizer):
                     }
                     required.append(key)
                 e["parameter_ref"] = key
-
-        # 3. Extract from segments with input or form role
-        for s in segments:
-            if isinstance(s, dict) and s.get("role") in ("input", "form"):
-                sid = s.get("id", "input")
-                key = _sanitize_param_key(sid)
-                if key not in properties:
-                    properties[key] = {
-                        "type": "string",
-                        "default": s.get("metadata", {}).get("value", "sample_input"),
-                        "description": f"Dynamic input for {s.get('label', sid)}",
-                    }
-                    required.append(key)
 
         # Fallback default if empty
         if not properties:
@@ -167,7 +154,7 @@ class DAGBuilder(BaseSynthesizer):
                 "Given keyframe transition summaries and SAM bounding box manifests, synthesize a compact Directed Acyclic Graph (DAG) "
                 "representing state transitions, DAG topology, and dynamic variables.\n"
                 "Extract variable parameters from input, fill, and selection events into 'parameters_schema'.\n"
-                "Return ONLY a clean valid JSON object with the following schema:\n"
+                "Return strictly valid, minified JSON. Do not include markdown code fences, trailing comments, or unescaped characters.\n"
                 "{\n"
                 '  "workflow_name": "string",\n'
                 '  "root_node": "state_root",\n'
@@ -253,13 +240,31 @@ class DAGBuilder(BaseSynthesizer):
                     max_tokens=4096,
                 )
 
-            raw_text = resp.choices[0].message.content or ""
+            raw_text = (resp.choices[0].message.content or "").strip()
             if "```json" in raw_text:
                 raw_text = raw_text.split("```json")[1].split("```")[0].strip()
             elif "```" in raw_text:
                 raw_text = raw_text.split("```")[1].split("```")[0].strip()
 
-            data = json.loads(raw_text)
+            first_brace = raw_text.find("{")
+            last_brace = raw_text.rfind("}")
+            if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+                raw_text = raw_text[first_brace : last_brace + 1]
+
+            data = None
+            try:
+                data = json.loads(raw_text)
+            except Exception:
+                try:
+                    repaired = re.sub(r",\s*([\]}])", r"\1", raw_text)
+                    data = json.loads(repaired)
+                except Exception:
+                    data = None
+
+            if not isinstance(data, dict):
+                logger.debug("Muse Spark response could not be parsed as valid JSON; cleanly using local synthesis.")
+                return None
+
             if "nodes" in data and "edges" in data:
                 if isinstance(data["nodes"], list):
                     nodes_dict = {}
@@ -356,7 +361,7 @@ class DAGBuilder(BaseSynthesizer):
                         g.add_edge(edge["from_node"], edge["to_node"])
 
                 if not nx.is_directed_acyclic_graph(g):
-                    logger.warning("Muse Spark synthesized graph contains cycles; using fallback.")
+                    logger.debug("Muse Spark synthesized graph contains cycles; cleanly using fallback.")
                     return None
 
                 topological_order = list(nx.topological_sort(g))
@@ -403,7 +408,7 @@ class DAGBuilder(BaseSynthesizer):
                 return dag_result
 
         except Exception as exc:
-            logger.warning(f"Muse Spark API request failed ({exc}); seamlessly falling back to local synthesis.")
+            logger.debug(f"Muse Spark API request handled via fallback ({exc}); seamlessly using local synthesis.")
 
         return None
 

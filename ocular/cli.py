@@ -45,15 +45,15 @@ app = typer.Typer(
 def print_banner(console_instance: Optional[Console] = None) -> None:
     """Renders the stylized ASCII banner with subtitle and version badge."""
     c = console_instance or console
-    ascii_art = (
-        r"   ____   ____ _   _ _        _    ____  " + "\n"
-        r"  / __ \ / ___| | | | |      / \  |  _ \ " + "\n"
-        r" | |  | | |   | | | | |     / _ \ | |_) |" + "\n"
-        r" | |__| | |___| |_| | |___ / ___ \|  _ < " + "\n"
-        r"  \____/ \____|\___/|_____/_/   \_\_| \_\""
-    )
-    banner_text = Text()
-    banner_text.append(ascii_art + "\n\n", style="bold cyan")
+    ascii_art = r"""
+  ██████╗  ██████╗██╗   ██╗██╗      █████╗ ██████╗ 
+ ██╔═══██╗██╔════╝██║   ██║██║     ██╔══██╗██╔══██╗
+ ██║   ██║██║     ██║   ██║██║     ███████║██████╔╝
+ ██║   ██║██║     ██║   ██║██║     ██╔══██║██╔══██╗
+ ╚██████╔╝╚██████╗╚██████╔╝███████╗██║  ██║██║  ██║
+  ╚═════╝  ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝
+""".strip("\n")
+    banner_text = Text(ascii_art + "\n\n", style="bold cyan")
     banner_text.append(
         "Offline Visual Workflow Compiler • Meta SAM 3.1 + Meta Muse Spark\n",
         style="bold white",

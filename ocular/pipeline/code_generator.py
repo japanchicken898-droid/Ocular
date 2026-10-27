@@ -72,26 +72,7 @@ class JinjaCodeGenerator(BaseGenerator):
                         }
                     )
 
-        # 2. Inspect segments for interactive input fields
-        for s in segments:
-            if isinstance(s, dict) and s.get("role") in ("input", "form"):
-                raw_key = s.get("id", "input")
-                key = _sanitize_param_key(raw_key)
-                if key not in seen_keys:
-                    seen_keys.add(key)
-                    inputs.append(
-                        {
-                            "key": key,
-                            "parameter_ref": key,
-                            "target_anchor": s.get("id"),
-                            "default_value": s.get("metadata", {}).get("value", "sample_input"),
-                            "label": s.get("label", key),
-                            "action": "fill",
-                            "selector": s.get("suggested_selector"),
-                        }
-                    )
-
-        # 3. Always ensure 'interval' is registered for TradingView or default workflows
+        # 2. Always ensure 'interval' is registered for TradingView or default workflows
         if "interval" not in seen_keys:
             inputs.append(
                 {
