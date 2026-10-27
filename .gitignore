@@ -38,3 +38,4 @@ htmlcov/
 *.jpg
 *.mp4
 .env
+.env
