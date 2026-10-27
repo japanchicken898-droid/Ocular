@@ -146,11 +146,17 @@ class JinjaCodeGenerator(BaseGenerator):
             encoding="utf-8",
         )
 
+        # 5. Save workflow_dag.mermaid
+        from ocular.pipeline.state_graph import export_mermaid_dag
+        mermaid_file = out_path / "workflow_dag.mermaid"
+        export_mermaid_dag(dag, mermaid_file)
+
         return {
             "playwright_driver": driver_file.resolve(),
             "app": app_file.resolve(),
             "main": main_file.resolve(),
             "state_graph": state_graph_file.resolve(),
+            "workflow_dag_mermaid": mermaid_file.resolve(),
         }
 
     def generate(

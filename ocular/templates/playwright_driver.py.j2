@@ -60,6 +60,7 @@ class OcularPlaywrightDriver:
         viewport_width: int = 1920,
         viewport_height: int = 1080,
         headless: bool = True,
+        slow_mo: int = 0,
         max_retries: int = 3,
         retry_delay_sec: float = 0.15,
     ) -> None:
@@ -67,6 +68,7 @@ class OcularPlaywrightDriver:
         self.viewport_width = viewport_width
         self.viewport_height = viewport_height
         self.headless = headless
+        self.slow_mo = slow_mo
         self.max_retries = max_retries
         self.retry_delay_sec = retry_delay_sec
 
@@ -158,7 +160,10 @@ class OcularPlaywrightDriver:
 
         try:
             async with async_playwright() as p:
-                browser: Browser = await p.chromium.launch(headless=self.headless)
+                browser: Browser = await p.chromium.launch(
+                    headless=self.headless,
+                    slow_mo=self.slow_mo if not self.headless else 0,
+                )
                 context = await browser.new_context(
                     viewport={"width": self.viewport_width, "height": self.viewport_height}
                 )
@@ -225,7 +230,10 @@ class OcularPlaywrightDriver:
 
         try:
             async with async_playwright() as p:
-                browser: Browser = await p.chromium.launch(headless=self.headless)
+                browser: Browser = await p.chromium.launch(
+                    headless=self.headless,
+                    slow_mo=self.slow_mo if not self.headless else 0,
+                )
                 context = await browser.new_context(
                     viewport={"width": self.viewport_width, "height": self.viewport_height}
                 )
@@ -274,6 +282,53 @@ class OcularPlaywrightDriver:
 
 
 if __name__ == "__main__":
-    driver = OcularPlaywrightDriver()
-    result = asyncio.run(driver.execute_workflow({"interval": "15m"}))
+    import argparse
+    import json
+
+    parser = argparse.ArgumentParser(description="Ocular Compiled Playwright Driver")
+    parser.add_argument(
+        "--headed",
+        action="store_true",
+        help="Launch visible Chromium browser with slowed action steps for demonstration",
+    )
+    parser.add_argument(
+        "--slow-mo",
+        type=int,
+        default=300,
+        help="Slowdown in milliseconds between action steps in headed mode (default: 300ms)",
+    )
+    parser.add_argument(
+        "--base-url",
+        type=str,
+        default="http://localhost:3000",
+        help="Target application root URL",
+    )
+    parser.add_argument(
+        "--interval",
+        type=str,
+        default="15m",
+        help="Timeframe interval parameter (for chart workflows)",
+    )
+    parser.add_argument(
+        "--params",
+        type=str,
+        default="{}",
+        help="JSON string with custom dynamic workflow parameters",
+    )
+    args = parser.parse_args()
+
+    payload = {"interval": args.interval}
+    try:
+        extra_params = json.loads(args.params)
+        if isinstance(extra_params, dict):
+            payload.update(extra_params)
+    except Exception:
+        pass
+
+    driver = OcularPlaywrightDriver(
+        base_url=args.base_url,
+        headless=not args.headed,
+        slow_mo=args.slow_mo if args.headed else 0,
+    )
+    result = asyncio.run(driver.execute_workflow(payload))
     print("Execution Result:", result)

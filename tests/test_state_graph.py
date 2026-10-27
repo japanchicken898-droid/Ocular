@@ -62,3 +62,45 @@ def test_mock_muse_synthesizer_typed_model():
     assert graph.initial_node_id in graph.nodes
     linear_path = graph.get_linear_path()
     assert isinstance(linear_path, list)
+
+
+def test_mermaid_dag_generation_and_export(tmp_path):
+    from ocular.pipeline.state_graph import generate_mermaid_dag, export_mermaid_dag
+    builder = DAGBuilder(workflow_name="MermaidTestWorkflow")
+    dag = builder.build_dag(segments=MockSAMSegmenter().segment())
+
+    mermaid_str = generate_mermaid_dag(dag)
+    assert "flowchart TD" in mermaid_str
+    assert "MermaidTestWorkflow" in mermaid_str
+    assert "state_root" in mermaid_str
+    assert ":::initNode" in mermaid_str
+
+    out_file = tmp_path / "test_dag.mermaid"
+    exported_path = export_mermaid_dag(dag, out_file)
+    assert exported_path.exists()
+    assert exported_path.read_text(encoding="utf-8") == mermaid_str
+
+
+def test_rich_dag_tree_rendering():
+    from ocular.pipeline.state_graph import render_rich_dag_tree
+    from rich.tree import Tree
+    builder = DAGBuilder(workflow_name="RichTreeTestWorkflow")
+    dag = builder.build_dag(segments=MockSAMSegmenter().segment())
+
+    tree = render_rich_dag_tree(dag)
+    assert isinstance(tree, Tree)
+    assert "RichTreeTestWorkflow" in str(tree.label)
+
+
+def test_muse_spark_meta_api_fallback(monkeypatch):
+    builder = DAGBuilder(workflow_name="FallbackWorkflow")
+    # Case 1: When META_MODEL_API_KEY is not set
+    monkeypatch.delenv("META_MODEL_API_KEY", raising=False)
+    assert builder._call_muse_spark_api([]) is None
+
+    # Case 2: When META_MODEL_API_KEY is set but endpoint is unreachable/mocked
+    monkeypatch.setenv("META_MODEL_API_KEY", "meta_test_key_abc123")
+    monkeypatch.setenv("MUSE_SPARK_API_ENDPOINT", "http://localhost:59999/unreachable")
+    # Should catch error and return None without crashing
+    assert builder._call_muse_spark_api([]) is None
+

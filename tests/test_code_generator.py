@@ -33,11 +33,15 @@ def test_jinja_code_generator(tmp_path: Path):
     assert app_file.exists()
     assert main_file.exists()
 
+    assert "workflow_dag_mermaid" in artifacts
+    assert (out_dir / "workflow_dag.mermaid").exists()
+
     driver_code = driver_file.read_text(encoding="utf-8")
     assert "class OcularPlaywrightDriver:" in driver_code
     assert "def denormalize_target(" in driver_code
     assert "click_with_retry" in driver_code
     assert "execute_workflow" in driver_code
+    assert "--headed" in driver_code
 
     app_code = app_file.read_text(encoding="utf-8")
     assert '@app.post("/api/v1/execute"' in app_code
