@@ -115,16 +115,29 @@ def compile_command(
         )
 
     # Derive workflow name dynamically from session metadata, path, or explicit parameter
+    meta_file = video_file.parent / "session_metadata.json"
+    origin_url = None
+    if meta_file.exists():
+        try:
+            import json
+            meta_json = json.loads(meta_file.read_text(encoding="utf-8"))
+            origin_url = meta_json.get("url") or meta_json.get("target_url")
+            if not workflow_name:
+                workflow_name = origin_url or meta_json.get("workflow_name")
+        except Exception:
+            pass
+
+    if not origin_url and telemetry_events:
+        for ev in telemetry_events:
+            val = ev.get("url") or ev.get("target_url") or ev.get("origin")
+            if val and isinstance(val, str) and ("http://" in val or "https://" in val):
+                origin_url = val
+                break
+
     if not workflow_name or workflow_name in ("TradingViewChartWorkflow", "OcularWorkflow", "OcularAutomatedWorkflow"):
-        meta_file = video_file.parent / "session_metadata.json"
-        if meta_file.exists():
-            try:
-                import json
-                meta_json = json.loads(meta_file.read_text(encoding="utf-8"))
-                workflow_name = meta_json.get("url") or meta_json.get("workflow_name")
-            except Exception:
-                pass
-        if not workflow_name or workflow_name in ("TradingViewChartWorkflow", "OcularWorkflow", "OcularAutomatedWorkflow"):
+        if origin_url:
+            workflow_name = origin_url
+        else:
             parent_name = video_file.parent.name
             if parent_name.startswith("session_") or "excalidraw" in parent_name:
                 workflow_name = parent_name
@@ -198,6 +211,9 @@ def compile_command(
         ):
             builder = DAGBuilder(workflow_name=workflow_name)
             dag = builder.build_dag(segments, transitions, telemetry_events=telemetry_events)
+            if origin_url:
+                dag["target_url"] = origin_url
+            dag["session_dir"] = str(video_file.parent.resolve())
 
         if getattr(builder, "last_inference_source", None) == "live_baseten_muse_spark" or os.environ.get("BASETEN_API_KEY"):
             console.print("    [green]✓[/green] Live Baseten Meta Muse Spark inference executed (model: meta-models/muse-spark-open-1026)")

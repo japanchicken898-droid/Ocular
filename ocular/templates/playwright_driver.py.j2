@@ -27,7 +27,7 @@ class {{ workflow_class_name }}:
 
     COMPILE_HASH = "{{ compile_hash }}"
     WORKFLOW_NAME = "{{ dag.workflow_name }}"
-    TARGET_URL = "{{ target_url or 'http://localhost:3000' }}"
+    TARGET_URL = "{{ target_url }}"
 
     # Normalized relative coordinates (0.0 -> 1.0) synthesized offline by SAM 3.1
     ANCHORS = {
@@ -472,6 +472,8 @@ if __name__ == "__main__":
     import argparse
     import json
 
+    TARGET_URL = {{ workflow_class_name }}.TARGET_URL
+
     parser = argparse.ArgumentParser(description="Ocular Compiled Playwright Driver")
     parser.add_argument(
         "--headed",
@@ -486,8 +488,10 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--base-url",
+        "-u",
+        "--url",
         type=str,
-        default="http://localhost:3000",
+        default=TARGET_URL,
         help="Target application root URL",
     )
     parser.add_argument(

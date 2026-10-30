@@ -41,6 +41,8 @@ def test_jinja_code_generator(tmp_path: Path):
     assert "OcularPlaywrightDriver" in driver_code
     assert "TARGET_URL" in driver_code
     assert "--live" in driver_code
+    assert "-u" in driver_code
+    assert "--url" in driver_code
     assert "def denormalize_target(" in driver_code
     assert "click_with_retry" in driver_code
     assert "execute_workflow" in driver_code

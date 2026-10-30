@@ -107,15 +107,28 @@ class OcularCompiler:
         )
 
         # Stage 3: Muse DAG State Synthesis
+        meta_file = video_path.parent / "session_metadata.json"
+        origin_url = None
+        if meta_file.exists():
+            try:
+                import json
+                meta_data = json.loads(meta_file.read_text(encoding="utf-8"))
+                origin_url = meta_data.get("url") or meta_data.get("target_url")
+                if not workflow_name:
+                    workflow_name = origin_url or meta_data.get("workflow_name")
+            except Exception:
+                pass
+
+        if not origin_url and loaded_events:
+            for ev in loaded_events:
+                val = ev.get("url") or ev.get("target_url") or ev.get("origin")
+                if val and isinstance(val, str) and ("http://" in val or "https://" in val):
+                    origin_url = val
+                    break
+
         if not workflow_name or workflow_name in ("OcularAutomatedWorkflow", "TradingViewChartWorkflow"):
-            meta_file = video_path.parent / "session_metadata.json"
-            if meta_file.exists():
-                try:
-                    import json
-                    meta_data = json.loads(meta_file.read_text(encoding="utf-8"))
-                    workflow_name = meta_data.get("url") or meta_data.get("workflow_name") or workflow_name
-                except Exception:
-                    pass
+            if origin_url:
+                workflow_name = origin_url
             elif "excalidraw" in video_path.parent.name.lower():
                 workflow_name = "https://excalidraw.com"
             elif video_path.parent.name.startswith("session_"):
@@ -131,6 +144,9 @@ class OcularCompiler:
             workflow_name=workflow_name,
             telemetry_events=loaded_events,
         )
+        if origin_url and hasattr(state_graph, "metadata"):
+            state_graph.metadata["target_url"] = origin_url
+            state_graph.metadata["session_dir"] = str(video_path.parent.resolve())
         self._notify(
             "synthesis_complete",
             {

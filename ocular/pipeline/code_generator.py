@@ -126,6 +126,75 @@ def extract_telemetry_input_parameters(telemetry_events: Optional[List[Dict[str,
     return inputs
 
 
+def extract_origin_url(
+    dag: Optional[Dict[str, Any]] = None,
+    telemetry_events: Optional[List[Dict[str, Any]]] = None,
+    out_dir: Optional[Union[str, Path]] = None,
+) -> str:
+    """Extracts the session recording's origin URL from session_metadata.json or telemetry events."""
+    dag = dag or {}
+
+    # 1. Direct DAG metadata
+    for k in ("target_url", "url", "origin_url", "origin"):
+        val = dag.get(k)
+        if val and isinstance(val, str) and ("http://" in val or "https://" in val):
+            return val.rstrip("/")
+
+    # 2. Check telemetry events (first event or any event)
+    if telemetry_events:
+        for ev in telemetry_events:
+            for k in ("url", "page_url", "origin", "target_url"):
+                val = ev.get(k)
+                if val and isinstance(val, str) and ("http://" in val or "https://" in val):
+                    return val.rstrip("/")
+
+    # 3. Check session_metadata.json in known recording paths
+    search_dirs: List[Path] = []
+    if out_dir:
+        out_p = Path(out_dir)
+        search_dirs.append(out_p)
+        name = out_p.name
+        if name.startswith("dist_"):
+            clean = name[len("dist_"):]
+            search_dirs.append(Path(f"recordings/session_{clean}"))
+            search_dirs.append(Path(f"recordings/{clean}"))
+
+    for key in ("recording_dir", "session_dir", "video_path", "input_path"):
+        p_val = dag.get(key)
+        if p_val:
+            p = Path(p_val)
+            search_dirs.append(p if p.is_dir() else p.parent)
+
+    search_dirs.extend([
+        Path("recordings/session_excalidraw"),
+        Path("recordings"),
+    ])
+
+    for sdir in search_dirs:
+        meta_file = sdir / "session_metadata.json"
+        if meta_file.exists():
+            try:
+                data = json.loads(meta_file.read_text(encoding="utf-8"))
+                for k in ("url", "target_url", "origin"):
+                    val = data.get(k)
+                    if val and isinstance(val, str) and ("http://" in val or "https://" in val):
+                        return val.rstrip("/")
+            except Exception:
+                pass
+
+    # 4. Check workflow name or raw name hints
+    raw_name = str(dag.get("workflow_name") or dag.get("url") or "")
+    if "excalidraw" in raw_name.lower():
+        return "https://excalidraw.com"
+
+    if "." in raw_name and not raw_name.endswith(".py"):
+        if "://" in raw_name:
+            return raw_name.rstrip("/")
+        return f"https://{raw_name}".rstrip("/")
+
+    return "http://localhost:3000"
+
+
 class JinjaCodeGenerator(BaseGenerator):
     """Compiles state graphs and visual segments into runnable domain-agnostic Python artifacts."""
 
@@ -322,12 +391,8 @@ class JinjaCodeGenerator(BaseGenerator):
             }
         dag["parameters_schema"] = parameters_schema
 
-        target_url = dag.get("target_url") or dag.get("url")
-        if not target_url:
-            if raw_name and ("." in str(raw_name) or "://" in str(raw_name)):
-                target_url = str(raw_name) if "://" in str(raw_name) else f"https://{raw_name}"
-            else:
-                target_url = "http://localhost:3000"
+        target_url = extract_origin_url(dag, telemetry_events=telemetry_events, out_dir=out_path)
+        dag["target_url"] = target_url
 
         anchors = {}
         for seg in segments:
@@ -415,8 +480,13 @@ class JinjaCodeGenerator(BaseGenerator):
         out_path = Path(dist_dir)
         out_path.mkdir(parents=True, exist_ok=True)
 
+        meta_url = getattr(graph, "target_url", None)
+        if not meta_url and hasattr(graph, "metadata") and isinstance(graph.metadata, dict):
+            meta_url = graph.metadata.get("target_url")
+
         dag_dict = {
             "workflow_name": graph.name,
+            "target_url": meta_url,
             "root_node": graph.initial_node_id,
             "terminal_node": graph.terminal_node_ids[0]
             if graph.terminal_node_ids
