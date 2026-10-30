@@ -26,6 +26,7 @@ from ocular.pipeline.code_generator import JinjaCodeGenerator
 from ocular.pipeline.segmenter import MetaSAMSegmenter, MockSAMSegmenter, export_visual_overlays
 from ocular.pipeline.state_graph import DAGBuilder, render_rich_dag_tree
 from ocular.pipeline.video_ingest import VideoIngestSampler
+from ocular.recorder import OcularSessionRecorder
 
 console = Console()
 logger = logging.getLogger("ocular.cli")
@@ -234,6 +235,95 @@ def compile_command(
         )
     )
     return 0
+
+
+def record_command(
+    url: str,
+    out_dir: str = "./recordings",
+    headless: bool = False,
+    duration: Optional[float] = None,
+) -> int:
+    """Executes the interactive session recorder pipeline with Rich terminal logging."""
+    print_banner(console)
+
+    console.print(
+        Panel(
+            f"[bold cyan]Interactive Session Recorder Manifest[/bold cyan]\n"
+            f"[dim]Capturing browser interaction stream, normalized telemetry, and canvas video[/dim]\n"
+            f"Target URL       : [yellow]{url}[/yellow]\n"
+            f"Output Directory : [yellow]{out_dir}[/yellow]\n"
+            f"Mode             : [green]{'Headless' if headless else 'Interactive (Headed)'}[/green]\n"
+            f"Status           : [bold green]● RECORDING ACTIVE[/bold green] [dim](Interact with browser; close window to finalize)[/dim]",
+            box=box.ROUNDED,
+            border_style="cyan",
+        )
+    )
+
+    recorder = OcularSessionRecorder(
+        out_dir=out_dir,
+        headless=headless,
+    )
+
+    try:
+        result = recorder.record(url=url, duration=duration)
+    except Exception as exc:
+        console.print(f"[bold red][!] Recording error:[/bold red] {exc}")
+        return 1
+
+    # Artifact Summary Table upon browser close
+    artifact_table = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
+    artifact_table.add_column("Artifact / Metric", style="white")
+    artifact_table.add_column("Details", style="green")
+
+    if result.get("video_path"):
+        artifact_table.add_row("Captured Video", str(result["video_path"]))
+    artifact_table.add_row("Telemetry Stream", str(result["telemetry_path"]))
+    artifact_table.add_row("Events Logged", str(result["event_count"]))
+    artifact_table.add_row("Session Elapsed", f"{result['elapsed_ms']} ms")
+
+    console.print(
+        Panel(
+            artifact_table,
+            title="[bold green]Recording Session Finalized[/bold green]",
+            subtitle="[dim]Telemetry events and video saved successfully[/dim]",
+            box=box.ROUNDED,
+            border_style="green",
+            padding=(1, 2),
+        )
+    )
+    return 0
+
+
+@app.command("record")
+def record_cli(
+    url: str = typer.Option(
+        ...,
+        "--url",
+        "-u",
+        help="Target URL for interactive recording session",
+    ),
+    out_dir: str = typer.Option(
+        "./recordings",
+        "--out-dir",
+        "-o",
+        help="Target output directory for recorded video and telemetry_events.jsonl",
+    ),
+    headless: bool = typer.Option(
+        False,
+        "--headless",
+        help="Run browser in headless mode (default: False)",
+    ),
+    duration: Optional[float] = typer.Option(
+        None,
+        "--duration",
+        "-t",
+        help="Auto-stop session after specified seconds (optional)",
+    ),
+) -> None:
+    """Record an interactive browser session capturing video and telemetry events."""
+    exit_code = record_command(url=url, out_dir=out_dir, headless=headless, duration=duration)
+    if exit_code != 0:
+        raise typer.Exit(code=exit_code)
 
 
 @app.command("compile")
