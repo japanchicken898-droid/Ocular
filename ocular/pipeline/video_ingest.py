@@ -130,7 +130,9 @@ class VideoIngestSampler:
         return diff_score, roi_bbox, motion_energy
 
     def sample_transitions(
-        self, video_path: Union[str, Path]
+        self,
+        video_path: Union[str, Path],
+        telemetry_events: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[np.ndarray]]:
         """Samples keyframes and detects UI state transitions from an MP4 file.
 
@@ -159,6 +161,17 @@ class VideoIngestSampler:
         prev_gray: Optional[np.ndarray] = None
         frame_idx = 0
 
+        # Filter telemetry clicks as point-prompt priors
+        click_events = (
+            [
+                e
+                for e in telemetry_events
+                if e.get("event_type") == "mousedown" or e.get("action_type") == "click"
+            ]
+            if telemetry_events
+            else []
+        )
+
         while True:
             if frame_idx % step == 0:
                 ret, frame = cap.read()
@@ -173,19 +186,38 @@ class VideoIngestSampler:
                 if prev_gray is not None:
                     diff, roi_bbox, motion_energy = self._compute_frame_diff(prev_gray, gray)
 
-                is_keyframe = (diff >= self.diff_threshold) or (len(sampled_frames) == 0)
+                curr_ts_ms = round((frame_idx / fps) * 1000.0, 2)
+                prev_ts_ms = round(((frame_idx - step) / fps) * 1000.0, 2) if frame_idx >= step else 0.0
+
+                # Match against telemetry click events
+                matched_clicks = [
+                    c for c in click_events
+                    if prev_ts_ms <= c.get("elapsed_ms", c.get("timestamp_ms", -1)) <= curr_ts_ms + 100.0
+                ]
+
+                is_keyframe = (diff >= self.diff_threshold) or (len(sampled_frames) == 0) or bool(matched_clicks)
                 sampled_frames.append(frame)
 
                 if is_keyframe and len(sampled_frames) > 1:
+                    matched_click = matched_clicks[0] if matched_clicks else None
+                    if matched_click and not roi_bbox:
+                        roi_bbox = {
+                            "x": matched_click.get("norm_x", 0.5),
+                            "y": matched_click.get("norm_y", 0.5),
+                            "width": 0.08,
+                            "height": 0.04,
+                        }
                     transitions.append(
                         {
                             "from_frame": len(sampled_frames) - 2,
                             "to_frame": len(sampled_frames) - 1,
-                            "timestamp_ms": round((frame_idx / fps) * 1000.0, 2),
-                            "diff_score": round(diff, 4),
+                            "timestamp_ms": matched_click.get("elapsed_ms", curr_ts_ms) if matched_click else curr_ts_ms,
+                            "diff_score": round(max(diff, 0.20 if matched_click else diff), 4),
                             "action": "click",
                             "roi_bbox": roi_bbox,
                             "motion_energy": round(motion_energy, 4),
+                            "target_selector": matched_click.get("target_selector") if matched_click else None,
+                            "telemetry_event": matched_click,
                         }
                     )
                 prev_gray = gray
@@ -210,9 +242,15 @@ class VideoIngestSampler:
 
         return video_info, transitions, sampled_frames
 
-    def ingest_timeline(self, video_path: Union[str, Path]) -> KeyframeIndex:
+    def ingest_timeline(
+        self,
+        video_path: Union[str, Path],
+        telemetry_events: Optional[List[Dict[str, Any]]] = None,
+    ) -> KeyframeIndex:
         """Full extraction and temporal differencing emitting an indexed KeyframeIndex structure."""
-        video_info, raw_transitions, raw_frames = self.sample_transitions(video_path)
+        video_info, raw_transitions, raw_frames = self.sample_transitions(
+            video_path, telemetry_events=telemetry_events
+        )
 
         frames_meta: List[FrameMetadata] = []
         keyframe_slices: List[KeyframeSlice] = []
@@ -275,6 +313,7 @@ class VideoIngestSampler:
                     to_frame_index=t["to_frame"],
                     timestamp_ms=t["timestamp_ms"],
                     action_type=ActionType.CLICK,
+                    target_selector=t.get("target_selector"),
                     diff_score=t["diff_score"],
                     confidence=min(1.0, 0.75 + t["diff_score"]),
                 )
@@ -289,22 +328,35 @@ class VideoIngestSampler:
         )
 
     def process_video(
-        self, video_path: Union[str, Path]
+        self,
+        video_path: Union[str, Path],
+        telemetry_events: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[List[FrameMetadata], List[TransitionEvent], List[np.ndarray]]:
         """Processes video recording and returns typed frames metadata and transitions."""
-        timeline = self.ingest_timeline(video_path)
-        raw_frames = [timeline.slices.get(f.frame_index) for f in timeline.frames_meta]
-        # In case some non-keyframes are None in slices, reconstruct or pull from sampler
-        _, _, all_sampled = self.sample_transitions(video_path)
+        timeline = self.ingest_timeline(video_path, telemetry_events=telemetry_events)
+        _, _, all_sampled = self.sample_transitions(video_path, telemetry_events=telemetry_events)
         return timeline.frames_meta, timeline.transitions, all_sampled
 
     def process_frames_list(
-        self, frames: List[np.ndarray], timestamps_ms: Optional[List[float]] = None
+        self,
+        frames: List[np.ndarray],
+        timestamps_ms: Optional[List[float]] = None,
+        telemetry_events: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[List[FrameMetadata], List[TransitionEvent], List[np.ndarray]]:
         """Processes in-memory synthetic frame list (for tests & programmatic invocation)."""
         frames_meta: List[FrameMetadata] = []
         transitions: List[TransitionEvent] = []
         prev_gray: Optional[np.ndarray] = None
+
+        click_events = (
+            [
+                e
+                for e in telemetry_events
+                if e.get("event_type") == "mousedown" or e.get("action_type") == "click"
+            ]
+            if telemetry_events
+            else []
+        )
 
         for idx, frame in enumerate(frames):
             h, w = frame.shape[:2]
@@ -320,7 +372,13 @@ class VideoIngestSampler:
                 abs_diff = cv2.absdiff(prev_gray, gray)
                 diff_score = float(np.mean(abs_diff) / 255.0)
 
-            is_keyframe = (diff_score >= self.diff_threshold) or (idx == 0)
+            # Match against telemetry clicks
+            matched_clicks = [
+                c for c in click_events
+                if abs(c.get("elapsed_ms", c.get("timestamp_ms", -1000.0)) - ts) <= 300.0
+            ]
+
+            is_keyframe = (diff_score >= self.diff_threshold) or (idx == 0) or bool(matched_clicks)
 
             frame_path = None
             if self.output_frames_dir and is_keyframe:
@@ -341,14 +399,16 @@ class VideoIngestSampler:
             frames_meta.append(meta)
 
             if is_keyframe and idx > 0:
+                matched_click = matched_clicks[0] if matched_clicks else None
                 transitions.append(
                     TransitionEvent(
                         from_frame_index=idx - 1,
                         to_frame_index=idx,
                         timestamp_ms=ts,
                         action_type=ActionType.CLICK,
+                        target_selector=matched_click.get("target_selector") if matched_click else None,
                         diff_score=diff_score,
-                        confidence=min(1.0, 0.75 + diff_score),
+                        confidence=min(1.0, (0.95 if matched_click else 0.75) + diff_score),
                     )
                 )
 

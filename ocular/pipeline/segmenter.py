@@ -116,6 +116,87 @@ def denormalize_coordinates(
     }
 
 
+def apply_point_prompt_priors(
+    segments: List[Dict[str, Any]],
+    point_prompts: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """Applies recorded click events as point-prompt priors for Meta SAM 3.1 anchor extraction."""
+    if not point_prompts:
+        return segments
+
+    click_prompts = [
+        p
+        for p in point_prompts
+        if p.get("event_type") == "mousedown" or p.get("action_type") == "click" or "norm_x" in p
+    ]
+    if not click_prompts:
+        return segments
+
+    results = [dict(s) for s in segments]
+    for idx, click in enumerate(click_prompts):
+        cx = float(click.get("norm_x", 0.0))
+        cy = float(click.get("norm_y", 0.0))
+        target_selector = click.get("target_selector")
+
+        matched = False
+        for s in results:
+            bbox = s.get("bbox", {})
+            bx = float(bbox.get("x", 0.0))
+            by = float(bbox.get("y", 0.0))
+            bw = float(bbox.get("width", 0.0))
+            bh = float(bbox.get("height", 0.0))
+
+            if (bx <= cx <= bx + bw) and (by <= cy <= by + bh):
+                matched = True
+                s["confidence"] = max(float(s.get("confidence", 0.9)), 0.99)
+                if "metadata" not in s or not isinstance(s["metadata"], dict):
+                    s["metadata"] = {}
+                s["metadata"]["point_prompt_prior"] = True
+                s["metadata"]["click_coords"] = {"norm_x": cx, "norm_y": cy}
+                if target_selector and not s.get("suggested_selector"):
+                    s["suggested_selector"] = target_selector
+                break
+
+        if not matched:
+            anchor_w = 0.08
+            anchor_h = 0.04
+            ax = max(0.0, min(1.0 - anchor_w, cx - anchor_w / 2.0))
+            ay = max(0.0, min(1.0 - anchor_h, cy - anchor_h / 2.0))
+
+            clean_id = (
+                target_selector.lstrip("#.").replace(".", "_").replace("-", "_").replace("[", "_").replace("]", "").replace("=", "_").replace('"', "")
+                if target_selector
+                else f"sam_anchor_click_{idx}"
+            )
+            if not clean_id or clean_id[0].isdigit():
+                clean_id = f"anchor_{clean_id}"
+
+            results.append(
+                {
+                    "id": clean_id,
+                    "label": clean_id,
+                    "role": "button",
+                    "bbox": {
+                        "x": round(ax, 4),
+                        "y": round(ay, 4),
+                        "width": round(anchor_w, 4),
+                        "height": round(anchor_h, 4),
+                    },
+                    "confidence": 0.985,
+                    "suggested_selector": target_selector or f"#{clean_id}",
+                    "metadata": {
+                        "source": "meta_sam_3.1_point_prompt",
+                        "point_prompt_prior": True,
+                        "norm_x": cx,
+                        "norm_y": cy,
+                        "elapsed_ms": click.get("elapsed_ms", 0),
+                    },
+                }
+            )
+
+    return results
+
+
 class OpenCVHeuristicSegmenter(BaseSegmenter):
     """Deterministic local element detector using edge, gradient, and contour heuristics."""
 
@@ -147,10 +228,11 @@ class OpenCVHeuristicSegmenter(BaseSegmenter):
         frame: Optional[np.ndarray] = None,
         frame_idx: int = 0,
         metadata: Optional[Dict[str, Any]] = None,
+        point_prompts: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         """Extracts interactable bounding boxes from an OpenCV image array."""
         if frame is None:
-            return []
+            return apply_point_prompt_priors([], point_prompts)
 
         h, w = frame.shape[:2]
         total_area = w * h
@@ -206,7 +288,8 @@ class OpenCVHeuristicSegmenter(BaseSegmenter):
             elem_counter += 1
 
         # Deduplicate heavily overlapping bounding boxes (NMS-style)
-        return self._filter_contained_boxes(segments)
+        filtered = self._filter_contained_boxes(segments)
+        return apply_point_prompt_priors(filtered, point_prompts)
 
     @staticmethod
     def _filter_contained_boxes(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -408,15 +491,16 @@ class MetaSAMSegmenter(BaseSegmenter):
         frame: Optional[np.ndarray] = None,
         frame_idx: int = 0,
         metadata: Optional[Dict[str, Any]] = None,
+        point_prompts: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         """Segments interactive elements using SAM 3.1 or deterministic local fallback."""
         if frame is None:
-            return self.fallback.segment(frame, frame_idx, metadata)
+            return self.fallback.segment(frame, frame_idx, metadata, point_prompts=point_prompts)
 
         # 1. Try Meta Model API if META_MODEL_API_KEY is configured
         api_segments = self._call_meta_sam_api(frame)
         if api_segments:
-            return api_segments
+            return apply_point_prompt_priors(api_segments, point_prompts)
 
         # 2. Try local SAM model if checkpoint configured
         if self._sam_model is not None:
@@ -438,21 +522,22 @@ class MetaSAMSegmenter(BaseSegmenter):
                             "metadata": {"stability_score": float(m.get("stability_score", 1.0))},
                         }
                     )
-                return segments
+                return apply_point_prompt_priors(segments, point_prompts)
             except Exception as exc:
                 logger.warning(f"SAM inference failed: {exc}, invoking local fallback.")
 
-        return self.fallback.segment(frame, frame_idx, metadata)
+        return self.fallback.segment(frame, frame_idx, metadata, point_prompts=point_prompts)
 
     def segment_batch(
         self,
         frames: List[np.ndarray],
         frames_meta: Optional[List[Any]] = None,
+        telemetry_events: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[int, List[VisualSegment]]:
         """Batch segmentation converting results into typed VisualSegment objects."""
         batch_results: Dict[int, List[VisualSegment]] = {}
         for idx, frame in enumerate(frames):
-            seg_dicts = self.segment(frame, idx)
+            seg_dicts = self.segment(frame, idx, point_prompts=telemetry_events)
             typed_segments = []
             for s in seg_dicts:
                 if isinstance(s, VisualSegment):
@@ -562,6 +647,7 @@ class MockSAMSegmenter(BaseSegmenter):
         frame: Optional[np.ndarray] = None,
         frame_idx: int = 0,
         metadata: Optional[Dict[str, Any]] = None,
+        point_prompts: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         """Segments canvas interactive masks, returning normalized relative bounding boxes."""
         if self._cached_segments is None:
@@ -570,24 +656,25 @@ class MockSAMSegmenter(BaseSegmenter):
         fixtures_copy = [dict(s) for s in self._cached_segments]
 
         if frame is not None and frame.size > 0:
-            detected = self._opencv_segmenter.segment(frame, frame_idx, metadata)
+            detected = self._opencv_segmenter.segment(frame, frame_idx, metadata, point_prompts=point_prompts)
             # Combine fixture anchors with newly detected contours
             existing_ids = {s["id"] for s in fixtures_copy}
             for d in detected:
                 if d["id"] not in existing_ids:
                     fixtures_copy.append(d)
 
-        return fixtures_copy
+        return apply_point_prompt_priors(fixtures_copy, point_prompts)
 
     def segment_batch(
         self,
         frames: List[np.ndarray],
         frames_meta: Optional[List[Any]] = None,
+        telemetry_events: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[int, List[VisualSegment]]:
         """Batch segmentation converting results into typed VisualSegment objects."""
         batch_results: Dict[int, List[VisualSegment]] = {}
         for idx, frame in enumerate(frames):
-            seg_dicts = self.segment(frame, idx)
+            seg_dicts = self.segment(frame, idx, point_prompts=telemetry_events)
             typed_segments = []
             for s in seg_dicts:
                 bbox_dict = s["bbox"]

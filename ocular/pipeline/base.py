@@ -17,6 +17,7 @@ class BaseSegmenter(ABC):
         frame: Optional[np.ndarray] = None,
         frame_idx: int = 0,
         metadata: Optional[Dict[str, Any]] = None,
+        point_prompts: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         """Segments interactive elements on screen into normalized bounding boxes & labels.
 
@@ -34,13 +35,14 @@ class BaseSegmenter(ABC):
         self,
         frames: List[np.ndarray],
         frames_meta: Optional[List[Any]] = None,
+        telemetry_events: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[int, List[Any]]:
         """Segments a batch of frames, keyed by frame index."""
         result: Dict[int, List[Any]] = {}
         for idx, frame in enumerate(frames):
             meta = frames_meta[idx] if frames_meta and idx < len(frames_meta) else None
             meta_dict = meta.model_dump() if hasattr(meta, "model_dump") else {}
-            result[idx] = self.segment(frame, idx, meta_dict)
+            result[idx] = self.segment(frame, idx, meta_dict, point_prompts=telemetry_events)
         return result
 
 
@@ -52,6 +54,7 @@ class BaseSynthesizer(ABC):
         self,
         segments: List[Dict[str, Any]],
         transitions: Optional[List[Dict[str, Any]]] = None,
+        telemetry_events: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Synthesizes interactive segments & transitions into a route & dependency DAG."""
         pass

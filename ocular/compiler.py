@@ -21,6 +21,7 @@ from ocular.pipeline.ingest import IngestPipeline
 from ocular.pipeline.segmenter import BaseSegmenter, MockSAMSegmenter
 from ocular.pipeline.state_graph import BaseSynthesizer, MockMuseSynthesizer
 from ocular.pipeline.code_generator import CodeGenerator
+from ocular.recorder import OcularSessionRecorder
 
 
 class OcularCompiler:
@@ -49,14 +50,42 @@ class OcularCompiler:
         video_path: str | Path,
         output_dir: str | Path = "dist",
         workflow_name: str = "OcularAutomatedWorkflow",
+        telemetry_path: Optional[str | Path] = None,
+        telemetry_events: Optional[List[Dict[str, Any]]] = None,
     ) -> CompiledArtifacts:
         """Compiles an MP4 video recording into executable Playwright + FastAPI artifacts."""
         video_path = Path(video_path)
         output_dir = Path(output_dir)
 
+        # Ingest telemetry if specified or co-located with video file
+        loaded_events: List[Dict[str, Any]] = list(telemetry_events or [])
+        if not loaded_events:
+            effective_telem_path = (
+                Path(telemetry_path)
+                if telemetry_path
+                else video_path.parent / "telemetry_events.jsonl"
+            )
+            if effective_telem_path.exists():
+                loaded_events = OcularSessionRecorder.load_telemetry_events(effective_telem_path)
+
+        if loaded_events:
+            self._notify(
+                "telemetry_ingested",
+                {
+                    "event_count": len(loaded_events),
+                    "clicks_count": sum(
+                        1
+                        for e in loaded_events
+                        if e.get("event_type") == "mousedown" or e.get("action_type") == "click"
+                    ),
+                },
+            )
+
         # Stage 1: Ingest
         self._notify("ingest_start", {"source": str(video_path)})
-        frames_meta, transitions, raw_frames = self.ingest.process_video(video_path)
+        frames_meta, transitions, raw_frames = self.ingest.process_video(
+            video_path, telemetry_events=loaded_events
+        )
         self._notify(
             "ingest_complete",
             {
@@ -69,7 +98,7 @@ class OcularCompiler:
         # Stage 2: SAM 3.1 Segmentation (Mocked / Pluggable)
         self._notify("segmentation_start", {"target_frames": len(raw_frames)})
         segments: Dict[int, List[VisualSegment]] = self.segmenter.segment_batch(
-            raw_frames, frames_meta
+            raw_frames, frames_meta, telemetry_events=loaded_events
         )
         total_segments = sum(len(segs) for segs in segments.values())
         self._notify(
@@ -84,6 +113,7 @@ class OcularCompiler:
             segments=segments,
             transitions=transitions,
             workflow_name=workflow_name,
+            telemetry_events=loaded_events,
         )
         self._notify(
             "synthesis_complete",
@@ -114,13 +144,34 @@ class OcularCompiler:
         output_dir: str | Path = "dist",
         workflow_name: str = "OcularAutomatedWorkflow",
         timestamps_ms: Optional[List[float]] = None,
+        telemetry_path: Optional[str | Path] = None,
+        telemetry_events: Optional[List[Dict[str, Any]]] = None,
     ) -> CompiledArtifacts:
         """Compiles in-memory frame sequences (useful for headless / test suites)."""
         output_dir = Path(output_dir)
 
+        loaded_events: List[Dict[str, Any]] = list(telemetry_events or [])
+        if not loaded_events and telemetry_path:
+            telem_p = Path(telemetry_path)
+            if telem_p.exists():
+                loaded_events = OcularSessionRecorder.load_telemetry_events(telem_p)
+
+        if loaded_events:
+            self._notify(
+                "telemetry_ingested",
+                {
+                    "event_count": len(loaded_events),
+                    "clicks_count": sum(
+                        1
+                        for e in loaded_events
+                        if e.get("event_type") == "mousedown" or e.get("action_type") == "click"
+                    ),
+                },
+            )
+
         self._notify("ingest_start", {"source": "in_memory_frames"})
         frames_meta, transitions, raw_frames = self.ingest.process_frames_list(
-            frames, timestamps_ms
+            frames, timestamps_ms, telemetry_events=loaded_events
         )
         self._notify(
             "ingest_complete",
@@ -132,7 +183,9 @@ class OcularCompiler:
         )
 
         self._notify("segmentation_start", {"target_frames": len(raw_frames)})
-        segments = self.segmenter.segment_batch(raw_frames, frames_meta)
+        segments = self.segmenter.segment_batch(
+            raw_frames, frames_meta, telemetry_events=loaded_events
+        )
         total_segments = sum(len(segs) for segs in segments.values())
         self._notify(
             "segmentation_complete",
@@ -145,6 +198,7 @@ class OcularCompiler:
             segments=segments,
             transitions=transitions,
             workflow_name=workflow_name,
+            telemetry_events=loaded_events,
         )
         self._notify(
             "synthesis_complete",

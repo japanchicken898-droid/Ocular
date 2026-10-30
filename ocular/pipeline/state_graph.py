@@ -416,6 +416,7 @@ class DAGBuilder(BaseSynthesizer):
         self,
         segments: List[Dict[str, Any]],
         transitions: Optional[List[Dict[str, Any]]] = None,
+        telemetry_events: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Synthesizes segments and actions into a validated Directed Acyclic Graph (DAG)."""
         # 1. Try official Meta Model API if configured
@@ -424,6 +425,27 @@ class DAGBuilder(BaseSynthesizer):
             return api_dag
 
         seg_by_id = {s["id"]: s for s in segments}
+
+        # Synthesize transitions from telemetry clicks if transitions is empty
+        if not transitions and telemetry_events:
+            transitions = []
+            clicks = [
+                e
+                for e in telemetry_events
+                if e.get("event_type") == "mousedown" or e.get("action_type") == "click"
+            ]
+            for c_idx, c in enumerate(clicks):
+                transitions.append(
+                    {
+                        "from_frame": max(0, c_idx - 1),
+                        "to_frame": c_idx,
+                        "timestamp_ms": c.get("elapsed_ms", c_idx * 500.0),
+                        "diff_score": 0.25,
+                        "action": "click",
+                        "target_selector": c.get("target_selector"),
+                        "telemetry_event": c,
+                    }
+                )
 
         # If dynamic transitions are provided with multiple frames
         if transitions and len(transitions) > 0:
@@ -485,12 +507,32 @@ class DAGBuilder(BaseSynthesizer):
                 from_nid = f"state_frame_{from_idx}" if from_idx > 0 else "state_root"
                 to_nid = f"state_frame_{to_idx}" if to_idx > 0 else "state_root"
 
-                # Pick an interactable segment as target
+                # Pick an interactable segment as target using telemetry point-prompt prior if available
                 target_seg_id = t.get("target_id")
+                telem_ev = t.get("telemetry_event")
+                if not target_seg_id and telem_ev:
+                    tx = telem_ev.get("norm_x")
+                    ty = telem_ev.get("norm_y")
+                    tsel = telem_ev.get("target_selector")
+                    for sid, s in seg_by_id.items():
+                        meta = s.get("metadata") or {}
+                        if meta.get("point_prompt_prior") and tx is not None and ty is not None:
+                            b = s.get("bbox", {})
+                            if (b.get("x", 0) <= tx <= b.get("x", 0) + b.get("width", 0)) and (b.get("y", 0) <= ty <= b.get("y", 0) + b.get("height", 0)):
+                                target_seg_id = sid
+                                break
+                        if tsel and s.get("suggested_selector") == tsel:
+                            target_seg_id = sid
+                            break
+
                 if not target_seg_id:
-                    # Pick from available segments
-                    available_ids = list(seg_by_id.keys())
-                    target_seg_id = available_ids[min(idx, len(available_ids) - 1)] if available_ids else f"target_{idx}"
+                    # Pick from available segments prioritizing point-prompt priors
+                    prior_ids = [sid for sid, s in seg_by_id.items() if (s.get("metadata") or {}).get("point_prompt_prior")]
+                    if prior_ids:
+                        target_seg_id = prior_ids[min(idx, len(prior_ids) - 1)]
+                    else:
+                        available_ids = list(seg_by_id.keys())
+                        target_seg_id = available_ids[min(idx, len(available_ids) - 1)] if available_ids else f"target_{idx}"
 
                 target_seg = seg_by_id.get(target_seg_id, {})
                 action = t.get("action", "click")
@@ -698,6 +740,7 @@ class DAGBuilder(BaseSynthesizer):
         segments: Optional[Dict[int, List[VisualSegment]]] = None,
         transitions: Optional[List[TransitionEvent]] = None,
         workflow_name: Optional[str] = None,
+        telemetry_events: Optional[List[Dict[str, Any]]] = None,
     ) -> StateGraph:
         """Synthesizes frames and transitions into a typed StateGraph model."""
         name = workflow_name or self.workflow_name
@@ -732,11 +775,12 @@ class DAGBuilder(BaseSynthesizer):
                     "timestamp_ms": t.timestamp_ms,
                     "diff_score": t.diff_score,
                     "action": t.action_type.value,
+                    "target_selector": getattr(t, "target_selector", None),
                 }
                 for t in transitions
             ]
 
-        dag_dict = self.build_dag(flat_segments, trans_dicts)
+        dag_dict = self.build_dag(flat_segments, trans_dicts, telemetry_events=telemetry_events)
 
         # Convert dag_dict to StateGraph
         typed_nodes: Dict[str, DAGNode] = {}

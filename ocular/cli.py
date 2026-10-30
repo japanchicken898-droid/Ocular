@@ -75,6 +75,7 @@ def compile_command(
     input_path: str,
     out_dir: str = "./dist",
     workflow_name: str = "TradingViewChartWorkflow",
+    telemetry_path: Optional[str] = None,
 ) -> int:
     """Executes the complete offline visual compilation pipeline with structured logging."""
     t_start = time.perf_counter()
@@ -94,11 +95,32 @@ def compile_command(
         )
     )
 
+    # Ingest telemetry event stream if available
+    telem_file = (
+        Path(telemetry_path)
+        if telemetry_path
+        else video_file.parent / "telemetry_events.jsonl"
+    )
+    telemetry_events: list = []
+    if telem_file.exists():
+        telemetry_events = OcularSessionRecorder.load_telemetry_events(telem_file)
+        clicks_count = sum(
+            1
+            for e in telemetry_events
+            if e.get("event_type") == "mousedown" or e.get("action_type") == "click"
+        )
+        console.print(
+            f"    [green]✓[/green] Ingested telemetry stream: [cyan]{len(telemetry_events)}[/cyan] events "
+            f"([yellow]{clicks_count}[/yellow] clicks as point-prompt priors) from [yellow]{telem_file}[/yellow]"
+        )
+
     # 1. Video Ingest Stage
     console.print("[bold green][+][/bold green] [bold]Stage 1: Video Ingest & Temporal Differencing[/bold]")
     sampler = VideoIngestSampler(sample_rate=2.0, diff_threshold=0.08)
     try:
-        video_info, transitions, raw_frames = sampler.sample_transitions(video_file)
+        video_info, transitions, raw_frames = sampler.sample_transitions(
+            video_file, telemetry_events=telemetry_events
+        )
         resolution_str = f"{video_info['height']}p @ {video_info['fps']}fps"
         frames_count = len(raw_frames)
         trans_count = len(transitions)
@@ -122,7 +144,7 @@ def compile_command(
         ):
             segmenter = MetaSAMSegmenter(fallback_segmenter=MockSAMSegmenter())
             sample_frame = raw_frames[0] if raw_frames else None
-            segments = segmenter.segment(sample_frame)
+            segments = segmenter.segment(sample_frame, point_prompts=telemetry_events)
 
         if getattr(segmenter, "last_inference_source", None) == "meta_sam_3.1_api" or os.environ.get("META_MODEL_API_KEY"):
             console.print("    [green]✓[/green] Live Meta SAM 3.1 inference executed (POST https://api.meta.ai/v1/responses)")
@@ -154,7 +176,7 @@ def compile_command(
             spinner="dots",
         ):
             builder = DAGBuilder(workflow_name=workflow_name)
-            dag = builder.build_dag(segments, transitions)
+            dag = builder.build_dag(segments, transitions, telemetry_events=telemetry_events)
 
         if getattr(builder, "last_inference_source", None) == "live_baseten_muse_spark" or os.environ.get("BASETEN_API_KEY"):
             console.print("    [green]✓[/green] Live Baseten Meta Muse Spark inference executed (model: meta-models/muse-spark-open-1026)")
@@ -346,9 +368,20 @@ def compile_cli(
         "-w",
         help="Custom name for the compiled workflow",
     ),
+    telemetry: Optional[str] = typer.Option(
+        None,
+        "--telemetry",
+        "-t",
+        help="Path to telemetry_events.jsonl (defaults to co-located file with input video)",
+    ),
 ) -> None:
     """Compile a screen recording into deterministic Playwright drivers and FastAPI service."""
-    exit_code = compile_command(input_path=input, out_dir=out_dir, workflow_name=workflow_name)
+    exit_code = compile_command(
+        input_path=input,
+        out_dir=out_dir,
+        workflow_name=workflow_name,
+        telemetry_path=telemetry,
+    )
     if exit_code != 0:
         raise typer.Exit(code=exit_code)
 
