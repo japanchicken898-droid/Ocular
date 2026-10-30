@@ -41,3 +41,6 @@ recordings/
 *.mp4
 .env
 .env
+
+dist_*/
+recordings/
