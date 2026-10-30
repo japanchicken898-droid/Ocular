@@ -12,7 +12,7 @@
 **Offline Visual Workflow Compiler**  
 *Built for the Meta Global AI Developer Hackathon 2026*
 
-[![Tests](https://img.shields.io/badge/tests-23%2F23%20passing-success)](#)
+[![Tests](https://img.shields.io/badge/tests-28%2F28%20passing-success)](#)
 [![Latency](https://img.shields.io/badge/latency-~146ms-blue)](#)
 [![Cost](https://img.shields.io/badge/runtime%20vision%20cost-$0.00-green)](#)
 [![Meta](https://img.shields.io/badge/Powered%20By-Meta%20SAM%203.1%20%7C%20Muse%20Spark-0668E1)](#)
@@ -47,38 +47,73 @@ Because spatial segmentation and state-transition logic are computed once during
 
 ---
 
+## System Architecture
+
+```mermaid
+flowchart TD
+    subgraph Capture["1. Interactive Session Capture"]
+        Browser["Target Web Application (Chromium)"]
+        Browser -->|Playwright video capture| Video["Video Recording (.webm / .mp4)"]
+        Browser -->|Injected JS event listener| Probe["Telemetry Probe: __ocular_push_telemetry"]
+        Probe --> TelemFile["telemetry_events.jsonl\n(norm_x, norm_y, elapsed_ms, selectors)"]
+    end
+
+    subgraph Compiler["2. Offline Compiler Pipeline"]
+        Video & TelemFile --> Stage1["Stage 1: Ingest & Differencing\n(Temporal alignment & keyframe extraction)"]
+        Stage1 --> Stage2["Stage 2: Meta SAM 3.1 Segmentation\n(Click events as point-prompt priors)"]
+        Stage2 --> Stage3["Stage 3: Meta Muse Spark DAG Synthesis\n(State transitions, parameters & schema)"]
+        Stage3 --> Stage4["Stage 4: Jinja2 Artifact Generator"]
+    end
+
+    subgraph Emitted["3. Zero-Inference Production Runtime"]
+        Stage4 --> Driver["Playwright Hybrid Driver\n(Semantic ARIA + SAM coordinate fallback)"]
+        Stage4 --> API["FastAPI Microservice + Swagger UI\n(~146ms latency, $0.00 runtime vision cost)"]
+    end
+```
+
+---
+
 ## How It Works (The Compiler Pipeline)
 
-1. **Stage 1: Video Ingest & Temporal Differencing** 
-   Extracts key transition frames and user interaction coordinates from the raw `.mp4` recording.
-2. **Stage 2: Spatial Segmentation (`api.meta.ai`)**
-   **Meta SAM 3.1** evaluates the frames, synthesizing scale-invariant visual masks (`[0.0, 1.0]`) for all interactive elements.
-3. **Stage 3: DAG Synthesis (`inference.baseten.co`)**
+1. **Stage 0: Interactive Session Recorder (`ocular record`)**
+   Spawns a headed Playwright browser session with an injected client-side telemetry probe (`__ocular_push_telemetry`). Captures raw interaction video alongside a streaming `telemetry_events.jsonl` file logging normalized coordinates (`norm_x`, `norm_y`), keypresses, and timestamps.
+2. **Stage 1: Video Ingest & Temporal Differencing** 
+   Extracts key transition frames and user interaction coordinates from the recorded video, aligning keyframes with telemetry timestamps.
+3. **Stage 2: Spatial Segmentation (`api.meta.ai`)**
+   **Meta SAM 3.1** evaluates the frames using recorded click events as point-prompt priors, synthesizing scale-invariant visual masks (`[0.0, 1.0]`) for all interactive elements.
+4. **Stage 3: DAG Synthesis (`inference.baseten.co`)**
    **Meta Muse Spark** evaluates state transitions, infers structural logic, extracts parameters, and compiles the verified state graph.
-4. **Stage 4: Artifact Generation**
+5. **Stage 4: Artifact Generation**
    Jinja2 templates emit the final production artifacts: `playwright_driver.py`, `app.py`, `main.py`, and typed `Pydantic` schemas.
 
 ---
 
 ## Quick Start & Verification
 
-**Prerequisites:** Python 3.10+ and Playwright installed.
+**Prerequisites:** Python 3.11+ and Playwright installed.
 
-### 1. Compile a Visual Workflow
-Pass a raw MP4 recording to the Ocular compiler:
+### 1. Record an Interactive Browser Session
+Launch the interactive session recorder targeting any web application:
 ```bash
-python -m ocular compile --input samples/sample_workflow.mp4 --out-dir ./dist
+python -m ocular record --url http://localhost:3000 --out-dir ./recordings
 ```
-*You will see the CLI render live progress for Meta SAM 3.1 segmentation, Muse Spark state synthesis, and the extracted parameters manifest.*
+*An interactive browser window opens with client-side telemetry probes injected. Interact with the target application (clicking buttons, entering inputs) and close the browser window when finished. Ocular saves the high-resolution video and `telemetry_events.jsonl` stream.*
 
-### 2. Execute the Emitted Driver (Headless)
+### 2. Compile a Visual Workflow
+Pass the recorded session into the Ocular compiler:
+```bash
+python -m ocular compile --input ./recordings/session.webm --out-dir ./dist
+```
+*If a `telemetry_events.jsonl` file is co-located in the input directory, Ocular automatically ingests it as point-prompt priors for SAM 3.1 and transition boundaries for Muse Spark. Alternatively, supply it explicitly with `--telemetry <path>`.*
+
+### 3. Execute the Emitted Driver (Headless)
 Run the emitted Playwright driver directly, injecting dynamic parameters on the fly:
 ```bash
 python dist/playwright_driver.py --params '{"interval": "1h"}'
 ```
 *The CLI will output a Rich telemetry dashboard confirming execution strategy (Semantic vs. SAM Visual), target anchor resolution, and sub-200ms latency.*
 
-### 3. Launch the Emitted FastAPI Microservice
+### 4. Launch the Emitted FastAPI Microservice
 Start the auto-generated REST API server:
 ```bash
 uvicorn dist.main:app --reload

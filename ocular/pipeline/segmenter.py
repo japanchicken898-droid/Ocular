@@ -140,13 +140,16 @@ def apply_point_prompt_priors(
 
         matched = False
         for s in results:
+            role = s.get("role")
             bbox = s.get("bbox", {})
             bx = float(bbox.get("x", 0.0))
             by = float(bbox.get("y", 0.0))
             bw = float(bbox.get("width", 0.0))
             bh = float(bbox.get("height", 0.0))
 
-            if (bx <= cx <= bx + bw) and (by <= cy <= by + bh):
+            is_background = role in ("canvas", "container") or (bw * bh) > 0.35
+
+            if not is_background and (bx <= cx <= bx + bw) and (by <= cy <= by + bh):
                 matched = True
                 s["confidence"] = max(float(s.get("confidence", 0.9)), 0.99)
                 if "metadata" not in s or not isinstance(s["metadata"], dict):

@@ -437,9 +437,9 @@ class DAGBuilder(BaseSynthesizer):
             for c_idx, c in enumerate(clicks):
                 transitions.append(
                     {
-                        "from_frame": max(0, c_idx - 1),
-                        "to_frame": c_idx,
-                        "timestamp_ms": c.get("elapsed_ms", c_idx * 500.0),
+                        "from_frame": c_idx,
+                        "to_frame": c_idx + 1,
+                        "timestamp_ms": c.get("elapsed_ms", (c_idx + 1) * 500.0),
                         "diff_score": 0.25,
                         "action": "click",
                         "target_selector": c.get("target_selector"),
