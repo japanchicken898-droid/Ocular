@@ -37,15 +37,18 @@ def test_jinja_code_generator(tmp_path: Path):
     assert (out_dir / "workflow_dag.mermaid").exists()
 
     driver_code = driver_file.read_text(encoding="utf-8")
-    assert "class OcularPlaywrightDriver:" in driver_code
+    assert "class " in driver_code
+    assert "OcularPlaywrightDriver" in driver_code
+    assert "TARGET_URL" in driver_code
+    assert "--live" in driver_code
     assert "def denormalize_target(" in driver_code
     assert "click_with_retry" in driver_code
     assert "execute_workflow" in driver_code
     assert "--headed" in driver_code
+    assert '<div id="' in driver_code
 
     app_code = app_file.read_text(encoding="utf-8")
     assert '@app.post("/api/v1/execute"' in app_code
     assert "ExecuteWorkflowRequest" in app_code
     assert "ExecuteWorkflowResponse" in app_code
-    assert '@app.post("/api/v1/chart/interval"' in app_code
     assert "X-Ocular-Compile-Hash" in app_code

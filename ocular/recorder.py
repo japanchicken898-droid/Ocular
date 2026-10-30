@@ -153,6 +153,13 @@ class OcularSessionRecorder:
         # Initialize empty telemetry file
         self.telemetry_path.write_text("", encoding="utf-8")
         self.telemetry_events.clear()
+        try:
+            (self.out_dir / "session_metadata.json").write_text(
+                json.dumps({"url": url, "timestamp": time.time()}),
+                encoding="utf-8"
+            )
+        except Exception:
+            pass
 
         start_time = time.perf_counter()
 

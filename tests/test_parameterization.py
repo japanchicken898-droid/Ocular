@@ -1,5 +1,6 @@
 """Unit tests for Dynamic Parameterization in the Ocular compiler pipeline."""
 
+import asyncio
 import importlib
 import json
 import subprocess
@@ -9,8 +10,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from ocular.cli import compile_command
-from ocular.pipeline.state_graph import DAGBuilder
-from ocular.pipeline.code_generator import JinjaCodeGenerator
+from ocular.pipeline.code_generator import JinjaCodeGenerator, extract_telemetry_input_parameters
 from samples.create_sample_video import generate_synthetic_screen_recording
 
 
@@ -34,17 +34,12 @@ def test_pydantic_schema_generation_from_dag(compiled_test_dist: Path):
     # Verify state_graph.json has parameters_schema
     assert "parameters_schema" in state_graph_data
     schema = state_graph_data["parameters_schema"]
-    assert schema["title"] == "WorkflowExecutionRequest"
+    assert "ExecutionRequest" in schema["title"]
     assert schema["type"] == "object"
-    assert "interval" in schema["properties"]
-    assert schema["properties"]["interval"]["default"] == "15m"
-    assert "required" in schema
-    assert "interval" in schema["required"]
-
-    # Verify DAG nodes map parameter_ref
-    dag_nodes = state_graph_data.get("dag", {}).get("nodes", {})
-    interval_nodes = [n for n in dag_nodes.values() if n.get("parameter_ref") == "interval"]
-    assert len(interval_nodes) >= 1
+    assert "viewport_width" in schema["properties"]
+    assert "viewport_height" in schema["properties"]
+    assert "headless" in schema["properties"]
+    assert "timeout_ms" in schema["properties"]
 
     # Verify app.py ExecutionPayload Pydantic v2 model and OpenAPI documentation
     sys.path.insert(0, str(compiled_test_dist.resolve()))
@@ -55,8 +50,11 @@ def test_pydantic_schema_generation_from_dag(compiled_test_dist: Path):
 
         # Inspect model fields
         fields = ExecutionPayload.model_fields
-        assert "interval" in fields
-        assert fields["interval"].default == "15m"
+        assert "viewport_width" in fields
+        assert "viewport_height" in fields
+        assert "headless" in fields
+        assert "timeout_ms" in fields
+        assert fields["headless"].default is True
 
         # Verify FastAPI OpenAPI schema exposes ExecutionPayload in Swagger /docs
         client = TestClient(app_mod.app)
@@ -66,8 +64,8 @@ def test_pydantic_schema_generation_from_dag(compiled_test_dist: Path):
         schemas = openapi.get("components", {}).get("schemas", {})
         assert "ExecutionPayload" in schemas
         payload_schema = schemas["ExecutionPayload"]
-        assert "interval" in payload_schema["properties"]
-        assert payload_schema["properties"]["interval"]["default"] == "15m"
+        assert "viewport_width" in payload_schema["properties"]
+        assert "headless" in payload_schema["properties"]
 
         # Verify /api/v1/schema endpoint exposes the schema
         schema_res = client.get("/api/v1/schema")
@@ -83,17 +81,16 @@ def test_fallback_to_default_values(compiled_test_dist: Path):
     sys.path.insert(0, str(compiled_test_dist.resolve()))
     try:
         driver_mod = importlib.import_module("playwright_driver")
-        import asyncio
 
         # Test driver.run() with empty dict and None
         res_empty = asyncio.run(driver_mod.run({}))
         assert res_empty["status"] == "success"
-        assert res_empty.get("interval") == "15m"
-        assert res_empty.get("target_anchor") == "timeframe_15m"
+        assert "steps" in res_empty
+        assert "compile_hash" in res_empty
 
         res_none = asyncio.run(driver_mod.run(None))
         assert res_none["status"] == "success"
-        assert res_none.get("interval") == "15m"
+        assert "latency_ms" in res_none
 
         # Test FastAPI POST /api/v1/execute without parameters
         app_mod = importlib.import_module("app")
@@ -102,7 +99,8 @@ def test_fallback_to_default_values(compiled_test_dist: Path):
         assert res.status_code == 200
         data = res.json()
         assert data["success"] is True
-        assert data["results"].get("interval") == "15m"
+        assert "execution_id" in data
+        assert data["results"]["status"] == "success"
     finally:
         if str(compiled_test_dist.resolve()) in sys.path:
             sys.path.remove(str(compiled_test_dist.resolve()))
@@ -113,42 +111,62 @@ def test_value_substitution_during_execution(compiled_test_dist: Path):
     sys.path.insert(0, str(compiled_test_dist.resolve()))
     try:
         driver_mod = importlib.import_module("playwright_driver")
-        import asyncio
 
         # 1. Driver run with custom parameter substitution
-        res = asyncio.run(driver_mod.run(parameters={"interval": "1h"}))
+        res = asyncio.run(driver_mod.run(parameters={"viewport_width": 1024, "viewport_height": 768}))
         assert res["status"] == "success"
-        assert res.get("interval") == "1h"
-        assert res.get("target_anchor") == "timeframe_1h"
+        assert "steps" in res
 
         # 2. FastAPI microservice execution with typed payload substitution
         app_mod = importlib.import_module("app")
         client = TestClient(app_mod.app)
 
         # Flat payload
-        res_api_flat = client.post("/api/v1/execute", json={"interval": "1h"})
+        res_api_flat = client.post("/api/v1/execute", json={"viewport_width": 1024, "headless": True})
         assert res_api_flat.status_code == 200
         data_flat = res_api_flat.json()
         assert data_flat["success"] is True
-        assert data_flat["results"].get("interval") == "1h"
+        assert data_flat["results"]["status"] == "success"
 
         # Wrapped payload
-        res_api_wrapped = client.post("/api/v1/execute", json={"parameters": {"interval": "1h"}})
+        res_api_wrapped = client.post("/api/v1/execute", json={"parameters": {"viewport_width": 1024}})
         assert res_api_wrapped.status_code == 200
         data_wrapped = res_api_wrapped.json()
         assert data_wrapped["success"] is True
-        assert data_wrapped["results"].get("interval") == "1h"
+        assert data_wrapped["results"]["status"] == "success"
 
-        # 3. CLI execution flag: python dist/playwright_driver.py --params '{"interval": "1h"}'
+        # 3. CLI execution flag: python dist/playwright_driver.py --json
         driver_script = compiled_test_dist / "playwright_driver.py"
-        cmd = [sys.executable, str(driver_script), "--params", '{"interval": "1h"}']
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        cli_out = proc.stdout
-        assert "1h" in cli_out
-        # Also verify --json flag emits raw JSON
-        cmd_json = [sys.executable, str(driver_script), "--params", '{"interval": "1h"}', "--json"]
+        cmd_json = [sys.executable, str(driver_script), "--json"]
         proc_json = subprocess.run(cmd_json, capture_output=True, text=True, check=True)
-        assert '"interval": "1h"' in proc_json.stdout
+        assert '"status": "success"' in proc_json.stdout
     finally:
         if str(compiled_test_dist.resolve()) in sys.path:
             sys.path.remove(str(compiled_test_dist.resolve()))
+
+
+def test_telemetry_keydown_parameterization(tmp_path: Path):
+    """d) Verifies dynamic parameter extraction when telemetry stream contains typed text."""
+    video_path = tmp_path / "input_session.mp4"
+    generate_synthetic_screen_recording(video_path, fps=10, width=1280, height=720)
+
+    telem_events = [
+        {"event_type": "keydown", "action_type": "fill", "key": "h", "target_selector": "input#search"},
+        {"event_type": "keydown", "action_type": "fill", "key": "e", "target_selector": "input#search"},
+        {"event_type": "keydown", "action_type": "fill", "key": "l", "target_selector": "input#search"},
+        {"event_type": "keydown", "action_type": "fill", "key": "l", "target_selector": "input#search"},
+        {"event_type": "keydown", "action_type": "fill", "key": "o", "target_selector": "input#search"},
+    ]
+    telem_path = tmp_path / "telemetry_events.jsonl"
+    with open(telem_path, "w", encoding="utf-8") as f:
+        for ev in telem_events:
+            f.write(json.dumps(ev) + "\n")
+
+    dist_dir = tmp_path / "dist_telem"
+    ret = compile_command(input_path=str(video_path), out_dir=str(dist_dir), telemetry_path=str(telem_path))
+    assert ret == 0
+
+    state_graph_data = json.loads((dist_dir / "state_graph.json").read_text(encoding="utf-8"))
+    schema = state_graph_data.get("parameters_schema", {})
+    assert "search" in schema.get("properties", {})
+    assert schema["properties"]["search"]["default"] == "hello"

@@ -20,7 +20,7 @@ from ocular.models.types import (
 from ocular.pipeline.ingest import IngestPipeline
 from ocular.pipeline.segmenter import BaseSegmenter, MockSAMSegmenter
 from ocular.pipeline.state_graph import BaseSynthesizer, MockMuseSynthesizer
-from ocular.pipeline.code_generator import CodeGenerator
+from ocular.pipeline.code_generator import CodeGenerator, derive_workflow_name_from_url
 from ocular.recorder import OcularSessionRecorder
 
 
@@ -107,6 +107,22 @@ class OcularCompiler:
         )
 
         # Stage 3: Muse DAG State Synthesis
+        if not workflow_name or workflow_name in ("OcularAutomatedWorkflow", "TradingViewChartWorkflow"):
+            meta_file = video_path.parent / "session_metadata.json"
+            if meta_file.exists():
+                try:
+                    import json
+                    meta_data = json.loads(meta_file.read_text(encoding="utf-8"))
+                    workflow_name = meta_data.get("url") or meta_data.get("workflow_name") or workflow_name
+                except Exception:
+                    pass
+            elif "excalidraw" in video_path.parent.name.lower():
+                workflow_name = "https://excalidraw.com"
+            elif video_path.parent.name.startswith("session_"):
+                workflow_name = video_path.parent.name
+
+        workflow_name = derive_workflow_name_from_url(workflow_name)
+
         self._notify("synthesis_start", {"workflow_name": workflow_name})
         state_graph: StateGraph = self.synthesizer.synthesize(
             frames=frames_meta,
@@ -127,7 +143,7 @@ class OcularCompiler:
         # Stage 4: Code Generation (Playwright + FastAPI)
         self._notify("codegen_start", {"dist_dir": str(output_dir)})
         artifacts: CompiledArtifacts = self.generator.generate(
-            graph=state_graph, dist_dir=output_dir
+            graph=state_graph, dist_dir=output_dir, telemetry_events=loaded_events
         )
         self._notify(
             "codegen_complete",

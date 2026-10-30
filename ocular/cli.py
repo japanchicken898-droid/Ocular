@@ -22,7 +22,7 @@ from rich.table import Table
 from rich.text import Text
 import typer
 
-from ocular.pipeline.code_generator import JinjaCodeGenerator
+from ocular.pipeline.code_generator import JinjaCodeGenerator, derive_workflow_name_from_url
 from ocular.pipeline.segmenter import MetaSAMSegmenter, MockSAMSegmenter, export_visual_overlays
 from ocular.pipeline.state_graph import DAGBuilder, render_rich_dag_tree
 from ocular.pipeline.video_ingest import VideoIngestSampler
@@ -74,7 +74,7 @@ def print_banner(console_instance: Optional[Console] = None) -> None:
 def compile_command(
     input_path: str,
     out_dir: str = "./dist",
-    workflow_name: str = "TradingViewChartWorkflow",
+    workflow_name: Optional[str] = None,
     telemetry_path: Optional[str] = None,
 ) -> int:
     """Executes the complete offline visual compilation pipeline with structured logging."""
@@ -113,6 +113,27 @@ def compile_command(
             f"    [green]✓[/green] Ingested telemetry stream: [cyan]{len(telemetry_events)}[/cyan] events "
             f"([yellow]{clicks_count}[/yellow] clicks as point-prompt priors) from [yellow]{telem_file}[/yellow]"
         )
+
+    # Derive workflow name dynamically from session metadata, path, or explicit parameter
+    if not workflow_name or workflow_name in ("TradingViewChartWorkflow", "OcularWorkflow", "OcularAutomatedWorkflow"):
+        meta_file = video_file.parent / "session_metadata.json"
+        if meta_file.exists():
+            try:
+                import json
+                meta_json = json.loads(meta_file.read_text(encoding="utf-8"))
+                workflow_name = meta_json.get("url") or meta_json.get("workflow_name")
+            except Exception:
+                pass
+        if not workflow_name or workflow_name in ("TradingViewChartWorkflow", "OcularWorkflow", "OcularAutomatedWorkflow"):
+            parent_name = video_file.parent.name
+            if parent_name.startswith("session_") or "excalidraw" in parent_name:
+                workflow_name = parent_name
+            elif "excalidraw" in str(input_path).lower():
+                workflow_name = "https://excalidraw.com"
+            else:
+                workflow_name = "OcularWorkflow"
+
+    workflow_name = derive_workflow_name_from_url(workflow_name)
 
     # 1. Video Ingest Stage
     console.print("[bold green][+][/bold green] [bold]Stage 1: Video Ingest & Temporal Differencing[/bold]")
@@ -194,7 +215,12 @@ def compile_command(
     console.print("[bold green][+][/bold green] [bold]Stage 4: Production Artifact Code Generation[/bold]")
     try:
         generator = JinjaCodeGenerator()
-        artifacts = generator.emit(dag=dag, segments=segments, out_dir=output_path)
+        artifacts = generator.emit(
+            dag=dag,
+            segments=segments,
+            out_dir=output_path,
+            telemetry_events=telemetry_events,
+        )
         console.print(f"    [green]✓[/green] Emitted: [yellow]{artifacts['playwright_driver'].name}[/yellow]")
         console.print(f"    [green]✓[/green] Emitted: [yellow]{artifacts['app'].name}[/yellow]")
         console.print(f"    [green]✓[/green] Emitted: [yellow]{artifacts['main'].name}[/yellow]")
@@ -220,11 +246,7 @@ def compile_command(
                 param_type = prop_meta.get("type", "string")
                 param_default = str(prop_meta.get("default", ""))
                 param_desc = prop_meta.get("description", "")
-                target_anchor = (
-                    "interval_dropdown"
-                    if param_name == "interval"
-                    else f"#{param_name}"
-                )
+                target_anchor = prop_meta.get("target_anchor") or f"#{param_name}"
                 table.add_row(param_name, param_type, param_default, target_anchor, param_desc)
 
             console.print(table)
@@ -233,7 +255,7 @@ def compile_command(
         return 1
 
     duration = time.perf_counter() - t_start
-    cli_cmd = f"python {out_dir}/playwright_driver.py --params '{{\"interval\": \"1h\"}}'"
+    cli_cmd = f"python {out_dir}/playwright_driver.py --headed"
     api_cmd = "uvicorn dist.main:app --reload"
     docs_url = "http://127.0.0.1:8000/docs"
 
@@ -362,11 +384,11 @@ def compile_cli(
         "-o",
         help="Target output directory for emitted code artifacts",
     ),
-    workflow_name: str = typer.Option(
-        "TradingViewChartWorkflow",
+    workflow_name: Optional[str] = typer.Option(
+        None,
         "--workflow-name",
         "-w",
-        help="Custom name for the compiled workflow",
+        help="Custom name for the compiled workflow (defaults to deriving from target URL/domain)",
     ),
     telemetry: Optional[str] = typer.Option(
         None,

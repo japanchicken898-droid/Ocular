@@ -32,7 +32,9 @@ ENV/
 .coverage
 htmlcov/
 .cache/
-
+dist/
+dist_*/
+recordings/
 # Screenshots
 *.png
 *.jpg

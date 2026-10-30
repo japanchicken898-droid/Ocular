@@ -33,28 +33,18 @@ def test_emitted_fastapi_endpoints(tmp_path: Path):
         assert health_data["status"] == "ok"
         assert health_data["compiler"] == "Ocular"
 
-        # 2. Test /api/v1/chart/status
-        res_status = client.get("/api/v1/chart/status")
-        assert res_status.status_code == 200
-        assert "X-Ocular-Compile-Hash" in res_status.headers
-        assert "X-Execution-Latency-MS" in res_status.headers
-        status_data = res_status.json()
-        assert status_data["canvas_present"] is True
+        # 2. Test /api/v1/schema
+        res_schema = client.get("/api/v1/schema")
+        assert res_schema.status_code == 200
+        schema_data = res_schema.json()
+        assert "parameters_schema" in schema_data
+        assert "anchors_count" in schema_data
+        assert schema_data["zero_runtime_vision"] is True
 
-        # 3. Test POST /api/v1/chart/interval
-        res_interval = client.post("/api/v1/chart/interval", json={"interval": "15m"})
-        assert res_interval.status_code == 200
-        assert "X-Ocular-Compile-Hash" in res_interval.headers
-        assert "X-Execution-Latency-MS" in res_interval.headers
-        interval_data = res_interval.json()
-        assert interval_data["success"] is True
-        assert interval_data["data"]["interval"] == "15m"
-
-        # 4. Test POST /api/v1/execute with Pydantic payload validation
+        # 3. Test POST /api/v1/execute with generic execution options
         res_exec = client.post(
             "/api/v1/execute",
             json={
-                "parameters": {"interval": "15m"},
                 "viewport_width": 1920,
                 "viewport_height": 1080,
                 "headless": True,

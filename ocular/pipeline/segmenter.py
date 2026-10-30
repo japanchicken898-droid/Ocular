@@ -653,10 +653,12 @@ class MockSAMSegmenter(BaseSegmenter):
         point_prompts: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         """Segments canvas interactive masks, returning normalized relative bounding boxes."""
-        if self._cached_segments is None:
-            self._cached_segments = self._load_fixtures()
-
-        fixtures_copy = [dict(s) for s in self._cached_segments]
+        if point_prompts:
+            fixtures_copy = []
+        else:
+            if self._cached_segments is None:
+                self._cached_segments = self._load_fixtures()
+            fixtures_copy = [dict(s) for s in self._cached_segments]
 
         if frame is not None and frame.size > 0:
             detected = self._opencv_segmenter.segment(frame, frame_idx, metadata, point_prompts=point_prompts)
