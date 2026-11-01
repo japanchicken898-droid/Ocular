@@ -52,6 +52,7 @@ class OcularCompiler:
         workflow_name: str = "OcularAutomatedWorkflow",
         telemetry_path: Optional[str | Path] = None,
         telemetry_events: Optional[List[Dict[str, Any]]] = None,
+        target_url: Optional[str] = None,
     ) -> CompiledArtifacts:
         """Compiles an MP4 video recording into executable Playwright + FastAPI artifacts."""
         video_path = Path(video_path)
@@ -108,8 +109,8 @@ class OcularCompiler:
 
         # Stage 3: Muse DAG State Synthesis
         meta_file = video_path.parent / "session_metadata.json"
-        origin_url = None
-        if meta_file.exists():
+        origin_url = target_url
+        if not origin_url and meta_file.exists():
             try:
                 import json
                 meta_data = json.loads(meta_file.read_text(encoding="utf-8"))
@@ -119,20 +120,9 @@ class OcularCompiler:
             except Exception:
                 pass
 
-        if not origin_url and loaded_events:
-            for ev in loaded_events:
-                val = ev.get("url") or ev.get("target_url") or ev.get("origin")
-                if val and isinstance(val, str) and ("http://" in val or "https://" in val):
-                    origin_url = val
-                    break
-
         if not workflow_name or workflow_name in ("OcularAutomatedWorkflow", "TradingViewChartWorkflow"):
             if origin_url:
                 workflow_name = origin_url
-            elif "excalidraw" in video_path.parent.name.lower():
-                workflow_name = "https://excalidraw.com"
-            elif video_path.parent.name.startswith("session_"):
-                workflow_name = video_path.parent.name
 
         workflow_name = derive_workflow_name_from_url(workflow_name)
 
@@ -144,9 +134,8 @@ class OcularCompiler:
             workflow_name=workflow_name,
             telemetry_events=loaded_events,
         )
-        if origin_url and hasattr(state_graph, "metadata"):
-            state_graph.metadata["target_url"] = origin_url
-            state_graph.metadata["session_dir"] = str(video_path.parent.resolve())
+        if origin_url:
+            state_graph.target_url = origin_url
         self._notify(
             "synthesis_complete",
             {
@@ -178,6 +167,7 @@ class OcularCompiler:
         timestamps_ms: Optional[List[float]] = None,
         telemetry_path: Optional[str | Path] = None,
         telemetry_events: Optional[List[Dict[str, Any]]] = None,
+        target_url: Optional[str] = "https://example.com/app",
     ) -> CompiledArtifacts:
         """Compiles in-memory frame sequences (useful for headless / test suites)."""
         output_dir = Path(output_dir)
@@ -232,6 +222,8 @@ class OcularCompiler:
             workflow_name=workflow_name,
             telemetry_events=loaded_events,
         )
+        if target_url:
+            state_graph.target_url = target_url
         self._notify(
             "synthesis_complete",
             {

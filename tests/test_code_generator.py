@@ -17,6 +17,7 @@ def test_jinja_code_generator(tmp_path: Path):
 
     builder = DAGBuilder()
     dag = builder.build_dag(segments)
+    dag["target_url"] = "https://example.com"
 
     out_dir = tmp_path / "dist"
     artifacts = generator.emit(dag=dag, segments=segments, out_dir=out_dir)

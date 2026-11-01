@@ -329,7 +329,7 @@ def test_mermaid_sanitization_and_symlink_defense(tmp_path: Path):
     symlink_driver.symlink_to(target_hijack)
 
     generator = JinjaCodeGenerator()
-    generator.emit(dag={"workflow_name": "Test"}, segments=[], out_dir=out_dir)
+    generator.emit(dag={"workflow_name": "Test", "target_url": "https://example.com"}, segments=[], out_dir=out_dir)
 
     # Symlink must be unlinked and original hijacked file untouched
     assert not symlink_driver.is_symlink()
@@ -384,9 +384,8 @@ async def test_driver_live_mode_fails_without_tautological_fallback(tmp_path: Pa
         assert driver_override.base_url == "https://override.example.com"
         assert driver_override.live is True
 
-        # 3. Test non-blocking _is_server_online probe
-        is_online = await driver._is_server_online(timeout_sec=0.1)
-        assert is_online is False
+        # 3. Verify _is_server_online probe removed to prevent pre-flight TCP probes (F4)
+        assert not hasattr(driver, "_is_server_online")
     finally:
         if str(dist_dir.resolve()) in sys.path:
             sys.path.remove(str(dist_dir.resolve()))
@@ -487,6 +486,7 @@ def test_driver_respects_step_timeout(tmp_path: Path):
     generator = JinjaCodeGenerator()
     dag = {
         "workflow_name": "TimeoutTestWorkflow",
+        "target_url": "https://example.com",
         "nodes": {
             "state_root": {"title": "Root"},
             "state_done": {"title": "Done"},
@@ -543,7 +543,7 @@ def test_browser_redirect_guard_blocks_private_ip(tmp_path: Path):
     """Verify that private and loopback subnets (RFC 1918 / 3927) are blocked by driver guard."""
     generator = JinjaCodeGenerator()
     out_dir = tmp_path / "guard_dist"
-    generator.emit(dag={"workflow_name": "GuardWorkflow"}, segments=[], out_dir=out_dir)
+    generator.emit(dag={"workflow_name": "GuardWorkflow", "target_url": "https://example.com"}, segments=[], out_dir=out_dir)
 
     import sys
     import importlib
@@ -601,7 +601,7 @@ def test_context_level_ssrf_route_interception(tmp_path: Path):
     """Verify that route interception is attached at the BrowserContext level."""
     generator = JinjaCodeGenerator()
     out_dir = tmp_path / "context_ssrf_dist"
-    artifacts = generator.emit(dag={"workflow_name": "ContextSSRFWorkflow"}, segments=[], out_dir=out_dir)
+    artifacts = generator.emit(dag={"workflow_name": "ContextSSRFWorkflow", "target_url": "https://example.com"}, segments=[], out_dir=out_dir)
 
     driver_code = artifacts["playwright_driver"].read_text(encoding="utf-8")
     assert "await context.route(" in driver_code
@@ -701,7 +701,7 @@ def test_ssrf_blocks_ipv4_mapped_ipv6_and_schemes(tmp_path: Path):
 
     generator = JinjaCodeGenerator()
     out_dir = tmp_path / "ssrf_guard_dist"
-    generator.emit(dag={"workflow_name": "SsrfGuardWorkflow"}, segments=[], out_dir=out_dir)
+    generator.emit(dag={"workflow_name": "SsrfGuardWorkflow", "target_url": "https://example.com"}, segments=[], out_dir=out_dir)
 
     sys.modules.pop("playwright_driver", None)
     sys.modules.pop("app", None)

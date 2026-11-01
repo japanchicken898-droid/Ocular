@@ -77,6 +77,7 @@ def compile_command(
     out_dir: str = "./dist",
     workflow_name: Optional[str] = None,
     telemetry_path: Optional[str] = None,
+    target_url: Optional[str] = None,
 ) -> int:
     """Executes the complete offline visual compilation pipeline with structured logging."""
     t_start = time.perf_counter()
@@ -117,8 +118,8 @@ def compile_command(
 
     # Derive workflow name dynamically from session metadata, path, or explicit parameter
     meta_file = video_file.parent / "session_metadata.json"
-    origin_url = None
-    if meta_file.exists():
+    origin_url = target_url
+    if not origin_url and meta_file.exists():
         try:
             import json
             meta_json = json.loads(meta_file.read_text(encoding="utf-8"))
@@ -128,24 +129,15 @@ def compile_command(
         except Exception:
             pass
 
-    if not origin_url and telemetry_events:
-        for ev in telemetry_events:
-            val = ev.get("url") or ev.get("target_url") or ev.get("origin")
-            if val and isinstance(val, str) and ("http://" in val or "https://" in val):
-                origin_url = val
-                break
+    if not origin_url:
+        console.print(
+            "[bold red][!] Compilation failed: No target URL specified. "
+            "Provide --target-url / -u or ensure session_metadata.json contains a valid http(s) origin.[/bold red]"
+        )
+        return 1
 
     if not workflow_name or workflow_name in ("TradingViewChartWorkflow", "OcularWorkflow", "OcularAutomatedWorkflow"):
-        if origin_url:
-            workflow_name = origin_url
-        else:
-            parent_name = video_file.parent.name
-            if parent_name.startswith("session_") or "excalidraw" in parent_name:
-                workflow_name = parent_name
-            elif "excalidraw" in str(input_path).lower():
-                workflow_name = "https://excalidraw.com"
-            else:
-                workflow_name = "OcularWorkflow"
+        workflow_name = origin_url
 
     workflow_name = derive_workflow_name_from_url(workflow_name)
 
@@ -419,6 +411,12 @@ def compile_cli(
         "-t",
         help="Path to telemetry_events.jsonl (defaults to co-located file with input video)",
     ),
+    target_url: Optional[str] = typer.Option(
+        None,
+        "--target-url",
+        "-u",
+        help="Target URL origin for the workflow",
+    ),
 ) -> None:
     """Compile a screen recording into deterministic Playwright drivers and FastAPI service."""
     exit_code = compile_command(
@@ -426,6 +424,7 @@ def compile_cli(
         out_dir=out_dir,
         workflow_name=workflow_name,
         telemetry_path=telemetry,
+        target_url=target_url,
     )
     if exit_code != 0:
         raise typer.Exit(code=exit_code)

@@ -179,6 +179,7 @@ class DAGEdge(BaseModel):
 
 class StateGraph(BaseModel):
     name: str = Field(default="OcularAutomatedWorkflow", max_length=128)
+    target_url: Optional[str] = Field(default=None, description="Workflow target origin URL")
     initial_node_id: str = Field(..., max_length=64)
     terminal_node_ids: List[str] = Field(default_factory=list)
     nodes: Dict[str, DAGNode] = Field(default_factory=dict)

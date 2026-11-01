@@ -25,130 +25,21 @@ from playwright.async_api import async_playwright, Page, Browser
 
 logger = logging.getLogger("ocular.driver")
 
-# Private/loopback subnets blocked during browser navigation to prevent SSRF via redirects
-BLOCKED_PRIVATE_NETWORKS = [
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("169.254.0.0/16"),
-    ipaddress.ip_network("0.0.0.0/8"),
-    ipaddress.ip_network("::1/128"),
-    ipaddress.ip_network("fc00::/7"),
-    ipaddress.ip_network("fe80::/10"),
-]
-_BLOCKED_NAV_NETWORKS = BLOCKED_PRIVATE_NETWORKS
+import os
+from netguard import (
+    BLOCKED_IP_NETWORKS,
+    canonicalize_url,
+    get_allowed_hosts,
+    host_is_blocked,
+    is_private_url,
+    resolve_and_check_host,
+    setup_confinement_routes,
+)
 
-
-def _parse_ip_safe(host: str) -> Optional[Union[ipaddress.IPv4Address, ipaddress.IPv6Address]]:
-    """Deterministically parse host into an IP address, handling IPv4-mapped IPv6, octal, hex, and int."""
-    if not host:
-        return None
-    h = host.strip("[]")
-    # 1. Standard ipaddress parser
-    try:
-        ip = ipaddress.ip_address(h)
-        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
-            return ip.ipv4_mapped
-        return ip
-    except ValueError:
-        pass
-
-    # 2. Integer or Hexadecimal IPv4 notation (e.g. 2130706433, 0x7f000001, 017700000001)
-    try:
-        if h.startswith(("0x", "0X")):
-            val = int(h, 16)
-            if 0 <= val <= 0xFFFFFFFF:
-                return ipaddress.IPv4Address(val)
-        elif h.isdigit():
-            val = int(h, 8) if (len(h) > 1 and h.startswith("0") and set(h) <= set("01234567")) else int(h, 10)
-            if 0 <= val <= 0xFFFFFFFF:
-                return ipaddress.IPv4Address(val)
-    except (ValueError, OverflowError):
-        pass
-
-    # 3. Dotted octal/hex notation (e.g. 0177.0.0.1, 0x7f.0.0.1)
-    try:
-        raw_bytes = socket.inet_aton(h)
-        return ipaddress.IPv4Address(raw_bytes)
-    except (OSError, ValueError):
-        pass
-
-    # 4. Fallback manual dotted parsing
-    parts = h.split(".")
-    if len(parts) == 4:
-        try:
-            coerced = []
-            for p in parts:
-                if p.startswith(("0x", "0X")):
-                    coerced.append(str(int(p, 16)))
-                elif p.startswith("0") and len(p) > 1 and p.isdigit():
-                    coerced.append(str(int(p, 8)))
-                elif p.isdigit():
-                    coerced.append(str(int(p, 10)))
-                else:
-                    break
-            if len(coerced) == 4:
-                return ipaddress.IPv4Address(".".join(coerced))
-        except (ValueError, OverflowError):
-            pass
-
-    return None
-
-
-def _is_private_url(url: str) -> bool:
-    """Check if a URL resolves to a private/loopback subnet or uses an unsafe scheme."""
-    try:
-        if not url or not isinstance(url, str):
-            return True
-        url_str = url.strip()
-        parsed = urlparse(url_str)
-        scheme = (parsed.scheme or "").lower()
-
-        # Reject non-http/https schemes (file, data, blob, about, gopher, etc.)
-        if scheme:
-            if scheme not in ("http", "https"):
-                return True
-        elif "://" in url_str:
-            return True
-
-        hostname = parsed.hostname
-        if not hostname:
-            first_seg = url_str.split("/")[0]
-            if first_seg.startswith("[") and "]" in first_seg:
-                hostname = first_seg[1:first_seg.index("]")]
-            else:
-                hostname = first_seg.split(":")[0]
-
-        if not hostname:
-            return True
-
-        # Fast literal check for common loopback names
-        if hostname.lower() in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
-            return True
-
-        # Parse host as IP (handles IPv4, IPv6, IPv4-mapped IPv6, octal, hex, int)
-        ip_obj = _parse_ip_safe(hostname)
-        if ip_obj is not None:
-            return any(ip_obj in net for net in BLOCKED_PRIVATE_NETWORKS)
-
-        # DNS-based check (synchronous, but used only in route handler for redirects)
-        try:
-            addr_info = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
-            for entry in addr_info:
-                ip_str = entry[4][0]
-                resolved_ip = _parse_ip_safe(ip_str)
-                if resolved_ip is not None and any(resolved_ip in net for net in BLOCKED_PRIVATE_NETWORKS):
-                    return True
-        except socket.gaierror:
-            pass
-
-        return False
-    except Exception:
-        return True
-
-
-is_private_url = _is_private_url
+# SSRF Protection & Backwards-compatibility aliases
+BLOCKED_PRIVATE_NETWORKS = BLOCKED_IP_NETWORKS
+_BLOCKED_NAV_NETWORKS = BLOCKED_IP_NETWORKS
+_is_private_url = is_private_url
 
 
 def _is_sensitive_identifier(val: Any) -> bool:
@@ -289,21 +180,6 @@ class {{ workflow_class_name }}:
         self.retry_delay_sec = retry_delay_sec
         self.semantic_timeout_ms = semantic_timeout_ms
         self.live = live
-
-    async def _is_server_online(self, timeout_sec: float = 0.5) -> bool:
-        """Lightweight non-blocking async probe to check if target application server is listening."""
-        try:
-            target_url = self.base_url or self.TARGET_URL
-            parsed = urlparse(target_url)
-            host = parsed.hostname or "127.0.0.1"
-            port = parsed.port or (443 if parsed.scheme == "https" else 80)
-            conn_coro = asyncio.open_connection(host, port)
-            reader, writer = await asyncio.wait_for(conn_coro, timeout=timeout_sec)
-            writer.close()
-            await writer.wait_closed()
-            return True
-        except Exception:
-            return False
 
     def denormalize_target(
         self,
@@ -529,40 +405,62 @@ class {{ workflow_class_name }}:
 
         try:
             async with async_playwright() as p:
+                launch_args = [
+                    "--disable-webrtc",
+                    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                ]
+                launch_kwargs: Dict[str, Any] = {
+                    "args": launch_args,
+                }
+                egress_proxy = os.environ.get("OCULAR_EGRESS_PROXY")
+                if egress_proxy:
+                    launch_kwargs["proxy"] = {"server": egress_proxy}
+
                 if not self.headless:
+                    launch_args.append(f"--window-size={self.viewport_width},{self.viewport_height}")
                     browser: Browser = await p.chromium.launch(
                         headless=False,
                         slow_mo=self.slow_mo,
-                        args=[
-                            f"--window-size={self.viewport_width},{self.viewport_height}",
-                        ],
+                        **launch_kwargs,
                     )
                 else:
-                    browser: Browser = await p.chromium.launch(headless=True, slow_mo=0)
+                    browser: Browser = await p.chromium.launch(
+                        headless=True,
+                        slow_mo=0,
+                        **launch_kwargs,
+                    )
 
                 context = await browser.new_context(
                     viewport={"width": self.viewport_width, "height": self.viewport_height},
                     color_scheme="dark",
+                    service_workers="block",
+                    accept_downloads=False,
+                    permissions=[],
                 )
 
-                # Browser-level SSRF redirect guard: intercept all context requests (popups, windows, iframes, redirects)
+                # Browser-level SSRF redirect guard: intercept all context requests
                 async def _ssrf_route_guard(route):
                     req_url = route.request.url
-                    if _is_private_url(req_url):
+                    if is_private_url(req_url):
                         logger.warning(f"Blocked browser navigation to private subnet: {req_url}")
                         await route.abort("blockedbyclient")
                     else:
                         await route.continue_()
 
-                await context.route("**/*", _ssrf_route_guard)
+                await context.route(re.compile(r".*"), _ssrf_route_guard)
+                await setup_confinement_routes(context)
                 page: Page = await context.new_page()
 
-                target_nav_url = (self.base_url or self.TARGET_URL).rstrip("/")
+                raw_target_url = (self.base_url or self.TARGET_URL).rstrip("/")
+                try:
+                    target_nav_url = canonicalize_url(raw_target_url)
+                except Exception:
+                    target_nav_url = raw_target_url
 
                 # Step 0: Directly load canvas content if offline to prevent error flash
                 if self.live:
                     try:
-                        await page.goto(target_nav_url, wait_until="domcontentloaded", timeout=15000)
+                        await page.goto(target_nav_url, wait_until="domcontentloaded", timeout=self.semantic_timeout_ms)
                     except Exception as nav_exc:
                         await browser.close()
                         return _redact_workflow_results({
@@ -575,11 +473,6 @@ class {{ workflow_class_name }}:
                             "steps": [],
                             "compile_hash": self.COMPILE_HASH,
                         })
-                elif await self._is_server_online():
-                    try:
-                        await page.goto(target_nav_url, timeout=1500, wait_until="domcontentloaded")
-                    except Exception:
-                        await page.set_content(self._build_mock_html(), wait_until="domcontentloaded")
                 else:
                     await page.set_content(self._build_mock_html(), wait_until="domcontentloaded")
 

@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
 from ocular.security.redaction import is_sensitive_field, redact_event
+from ocular.telemetry import coerce_telemetry_event
 
 logger = logging.getLogger("ocular.recorder")
 
@@ -226,6 +227,8 @@ class OcularSessionRecorder:
         self.telemetry_events: List[Dict[str, Any]] = []
         self.telemetry_path = self.out_dir / "telemetry_events.jsonl"
         self.video_path: Optional[Path] = None
+        self.truncated: bool = False
+        self._max_warning_logged: bool = False
 
     def get_init_script(self, nonce: Optional[str] = None) -> str:
         """Returns initialization script injected with the per-session random nonce."""
@@ -257,41 +260,8 @@ class OcularSessionRecorder:
 
     @staticmethod
     def coerce_telemetry_event(event: Any) -> Optional[Dict[str, Any]]:
-        """Safely coerces numeric fields in a telemetry event dictionary, rejecting non-dict objects."""
-        if not isinstance(event, dict):
-            return None
-        e = dict(event)
-        # Coerce elapsed_ms safely via int(event.get("elapsed_ms") or 0) inside try ... except
-        try:
-            val = e.get("elapsed_ms")
-            if val is None:
-                raw_ts = e.get("timestamp_ms")
-                val = raw_ts if raw_ts is not None else 0
-            e["elapsed_ms"] = int(float(val) if isinstance(val, str) else (val or 0))
-        except (ValueError, TypeError):
-            e["elapsed_ms"] = 0
-
-        # Coerce timestamp_ms
-        try:
-            val_ts = e.get("timestamp_ms")
-            e["timestamp_ms"] = float(val_ts) if val_ts is not None else float(e["elapsed_ms"])
-        except (ValueError, TypeError):
-            e["timestamp_ms"] = float(e["elapsed_ms"])
-
-        # Coerce norm_x and norm_y coordinates safely via float(...) with fallback to 0.0
-        try:
-            val_x = e.get("norm_x")
-            e["norm_x"] = float(val_x) if val_x is not None else 0.0
-        except (ValueError, TypeError):
-            e["norm_x"] = 0.0
-
-        try:
-            val_y = e.get("norm_y")
-            e["norm_y"] = float(val_y) if val_y is not None else 0.0
-        except (ValueError, TypeError):
-            e["norm_y"] = 0.0
-
-        return e
+        """Safely coerces numeric fields in a telemetry event dictionary using shared telemetry module."""
+        return coerce_telemetry_event(event)
 
     def push_telemetry_event(self, event_data: Dict[str, Any]) -> None:
         """Appends an event to in-memory history and streams to telemetry_events.jsonl."""
@@ -322,9 +292,12 @@ class OcularSessionRecorder:
             return
 
         if len(self.telemetry_events) >= self.MAX_TELEMETRY_EVENTS:
-            logger.warning(
-                f"Telemetry event limit reached ({self.MAX_TELEMETRY_EVENTS}). Dropping event."
-            )
+            if not self._max_warning_logged:
+                logger.warning(
+                    f"Telemetry event limit reached ({self.MAX_TELEMETRY_EVENTS}). Truncating events."
+                )
+                self._max_warning_logged = True
+            self.truncated = True
             return
 
         sanitized_event = self._truncate_attributes(event_data)
@@ -367,9 +340,16 @@ class OcularSessionRecorder:
         # Initialize empty telemetry file
         self.telemetry_path.write_text("", encoding="utf-8")
         self.telemetry_events.clear()
+        self.truncated = False
+        self._max_warning_logged = False
+        start_epoch_ms = int(time.time() * 1000)
         try:
             (self.out_dir / "session_metadata.json").write_text(
-                json.dumps({"url": url, "timestamp": time.time()}),
+                json.dumps({
+                    "url": url,
+                    "timestamp": time.time(),
+                    "start_timestamp_ms": start_epoch_ms,
+                }),
                 encoding="utf-8"
             )
         except Exception:
@@ -444,6 +424,7 @@ class OcularSessionRecorder:
             "events": self.telemetry_events,
             "url": url,
             "elapsed_ms": elapsed_total,
+            "truncated": getattr(self, "truncated", False),
         }
 
     def record(self, url: str, **kwargs: Any) -> Dict[str, Any]:
@@ -453,6 +434,9 @@ class OcularSessionRecorder:
     @staticmethod
     def load_telemetry_events(path: Union[str, Path]) -> List[Dict[str, Any]]:
         """Parses telemetry_events.jsonl into a list of event dictionaries, safely rejecting non-dict payloads."""
+        from ocular.telemetry import load_telemetry_events as _load
+        events, _ = _load(path)
+        return events
         file_path = Path(path)
         if not file_path.exists():
             return []

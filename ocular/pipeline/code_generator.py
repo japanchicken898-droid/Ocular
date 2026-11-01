@@ -205,6 +205,15 @@ def derive_workflow_name_from_url(url_or_name: Optional[str], default: str = "Oc
     return sanitize_workflow_class_name(pascal)
 
 
+IGNORED_NAMED_KEYS = {
+    "shift", "control", "alt", "meta", "capslock",
+    "arrowup", "arrowdown", "arrowleft", "arrowright",
+    "enter", "tab", "escape", "dead", "process",
+    "home", "end", "pageup", "pagedown", "insert",
+    "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12",
+}
+
+
 def extract_telemetry_input_parameters(telemetry_events: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
     """Extracts and groups keypress/input text events from telemetry stream into dynamic parameters."""
     inputs: List[Dict[str, Any]] = []
@@ -219,6 +228,9 @@ def extract_telemetry_input_parameters(telemetry_events: Optional[List[Dict[str,
         action = str(ev.get("action_type", "")).lower()
         if ev_type in ("keydown", "input", "keypress") or action in ("fill", "type"):
             target = ev.get("target_selector") or ev.get("target_tag") or "text_input"
+            # Hashing/processing of selector must tolerate non-str by skipping
+            if not isinstance(target, str):
+                continue
             by_target.setdefault(target, []).append(ev)
 
     seen_keys: Set[str] = set()
@@ -252,13 +264,19 @@ def extract_telemetry_input_parameters(telemetry_events: Optional[List[Dict[str,
         if is_sensitive or key not in EXPLICIT_PARAMETER_ALLOWLIST:
             default_val = ""
         else:
-            chars = []
+            chars: List[str] = []
             for e in ev_list:
-                k = e.get("key") or e.get("value") or ""
-                if len(k) == 1:
-                    chars.append(k)
-                elif k and k not in ("Enter", "Tab", "Shift", "Control", "Alt", "Meta", "Escape"):
-                    chars.append(k)
+                raw_k = e.get("key") if "key" in e else e.get("value")
+                if not isinstance(raw_k, str):
+                    continue
+                k_lower = raw_k.lower()
+                if k_lower == "backspace":
+                    if chars:
+                        chars.pop()
+                elif k_lower in IGNORED_NAMED_KEYS:
+                    continue
+                elif len(raw_k) == 1:
+                    chars.append(raw_k)
             default_val = "".join(chars) if chars else "sample_input"
 
         inputs.append({
@@ -278,71 +296,64 @@ def extract_origin_url(
     dag: Optional[Dict[str, Any]] = None,
     telemetry_events: Optional[List[Dict[str, Any]]] = None,
     out_dir: Optional[Union[str, Path]] = None,
+    session_dir: Optional[Union[str, Path]] = None,
 ) -> str:
-    """Extracts the session recording's origin URL from session_metadata.json or telemetry events."""
+    """Extracts the session recording's origin URL from trusted sources only:
+    1. Direct DAG metadata (passed from CLI --target-url / -u or target_url/url key)
+    2. session_metadata.json written by recorder in the session dir or out dir.
+
+    NEVER from telemetry events or CWD-relative search paths.
+    Never silently defaults to localhost:3000.
+    Raises CompilationError if no valid origin is found.
+    """
     dag = dag or {}
+
+    def _validate_origin(val: Any) -> Optional[str]:
+        if not val or not isinstance(val, str):
+            return None
+        val_str = val.strip()
+        try:
+            parsed = urlparse(val_str)
+            if parsed.scheme in ("http", "https") and parsed.hostname:
+                return val_str.rstrip("/")
+        except Exception:
+            pass
+        return None
 
     # 1. Direct DAG metadata
     for k in ("target_url", "url", "origin_url", "origin"):
-        val = dag.get(k)
-        if val and isinstance(val, str) and ("http://" in val or "https://" in val):
-            return val.rstrip("/")
+        validated = _validate_origin(dag.get(k))
+        if validated:
+            return validated
 
-    # 2. Check telemetry events (first event or any event)
-    if telemetry_events:
-        for ev in telemetry_events:
-            if not isinstance(ev, dict):
-                continue
-            for k in ("url", "page_url", "origin", "target_url"):
-                val = ev.get(k)
-                if val and isinstance(val, str) and ("http://" in val or "https://" in val):
-                    return val.rstrip("/")
-
-    # 3. Check session_metadata.json in known recording paths
-    search_dirs: List[Path] = []
-    if out_dir:
-        out_p = Path(out_dir)
-        search_dirs.append(out_p)
-        name = out_p.name
-        if name.startswith("dist_"):
-            clean = name[len("dist_"):]
-            search_dirs.append(Path(f"recordings/session_{clean}"))
-            search_dirs.append(Path(f"recordings/{clean}"))
-
+    # 2. Check session_metadata.json in trusted directories
+    candidate_dirs: List[Path] = []
+    if session_dir:
+        candidate_dirs.append(Path(session_dir))
     for key in ("recording_dir", "session_dir", "video_path", "input_path"):
         p_val = dag.get(key)
         if p_val:
             p = Path(p_val)
-            search_dirs.append(p if p.is_dir() else p.parent)
+            candidate_dirs.append(p if p.is_dir() else p.parent)
+    if out_dir:
+        candidate_dirs.append(Path(out_dir))
 
-    search_dirs.extend([
-        Path("recordings/session_excalidraw"),
-        Path("recordings"),
-    ])
-
-    for sdir in search_dirs:
+    for sdir in candidate_dirs:
         meta_file = sdir / "session_metadata.json"
         if meta_file.exists():
             try:
                 data = json.loads(meta_file.read_text(encoding="utf-8"))
-                for k in ("url", "target_url", "origin"):
-                    val = data.get(k)
-                    if val and isinstance(val, str) and ("http://" in val or "https://" in val):
-                        return val.rstrip("/")
+                for k in ("url", "target_url", "origin", "origin_url"):
+                    validated = _validate_origin(data.get(k))
+                    if validated:
+                        return validated
             except Exception:
                 pass
 
-    # 4. Check workflow name or raw name hints
-    raw_name = str(dag.get("workflow_name") or dag.get("url") or "")
-    if "excalidraw" in raw_name.lower():
-        return "https://excalidraw.com"
-
-    if "." in raw_name and not raw_name.endswith(".py"):
-        if "://" in raw_name:
-            return raw_name.rstrip("/")
-        return f"https://{raw_name}".rstrip("/")
-
-    return "http://localhost:3000"
+    raise CompilationError(
+        "No target URL specified. Provide target_url in DAG/CLI (--target-url / -u) "
+        "or ensure session_metadata.json contains a valid http(s) origin."
+    )
 
 
 class JinjaCodeGenerator(BaseGenerator):
@@ -536,8 +547,8 @@ class JinjaCodeGenerator(BaseGenerator):
         out_path = Path(out_dir)
         out_path.mkdir(parents=True, exist_ok=True)
 
-        # Derive workflow class name dynamically from URL domain or dag name
-        raw_name = dag.get("target_url") or dag.get("url") or dag.get("workflow_name")
+        # Derive workflow class name dynamically from dag name or URL domain
+        raw_name = dag.get("workflow_name") or dag.get("target_url") or dag.get("url")
         workflow_class_name = derive_workflow_name_from_url(raw_name)
         workflow_class_name = sanitize_workflow_class_name(workflow_class_name)
         dag["workflow_name"] = workflow_class_name
@@ -727,6 +738,12 @@ class JinjaCodeGenerator(BaseGenerator):
         mermaid_file = out_path / "workflow_dag.mermaid"
         export_mermaid_dag(dag, mermaid_file)
 
+        # 6. Copy netguard.py (shared SSRF and network confinement engine)
+        import ocular.security.netguard as netguard_module
+        netguard_src = Path(netguard_module.__file__)
+        netguard_dst = out_path / "netguard.py"
+        self._safe_write_text(netguard_dst, netguard_src.read_text(encoding="utf-8"))
+
         return {
             "playwright_driver": driver_file.resolve(),
             "app": app_file.resolve(),
@@ -734,6 +751,7 @@ class JinjaCodeGenerator(BaseGenerator):
             "state_graph": state_graph_file.resolve(),
             "workflow_dag_mermaid": mermaid_file.resolve(),
             "workflow_json": workflow_json_file.resolve(),
+            "netguard": netguard_dst.resolve(),
         }
 
     def generate(

@@ -194,6 +194,7 @@ def test_secrets_never_appear_in_any_emitted_file(tmp_path: Path):
 
     dag = {
         "workflow_name": "SecretsTestWorkflow",
+        "target_url": "https://example.com",
         "nodes": {s["id"]: {"role": s["role"]} for s in segments},
         "edges": [
             {
@@ -266,6 +267,7 @@ def test_fastapi_schema_and_echo_redaction(tmp_path: Path):
     ]
     dag = {
         "workflow_name": "ApiSecretsWorkflow",
+        "target_url": "https://example.com",
         "nodes": {"pwd_input": {"role": "input"}},
         "edges": [
             {

@@ -22,6 +22,7 @@ def test_phase0_non_dict_edges_and_segments_raise_compilation_error(tmp_path: Pa
 
     valid_dag = {
         "workflow_name": "ValidWorkflow",
+        "target_url": "https://example.com",
         "root_node": "state_root",
         "terminal_node": "state_root",
         "nodes": {
@@ -58,6 +59,7 @@ def test_phase0_nan_and_infinite_coordinates_raise_compilation_error(tmp_path: P
 
     base_dag = {
         "workflow_name": "NanWorkflow",
+        "target_url": "https://example.com",
         "root_node": "state_root",
         "terminal_node": "state_root",
         "nodes": {
@@ -105,6 +107,7 @@ def test_phase0_injection_payloads_in_ids_and_metadata(tmp_path: Path):
     }
     dag = {
         "workflow_name": "InjectWorkflow",
+        "target_url": "https://example.com",
         "root_node": "state_root",
         "nodes": {"state_root": {"id": "state_root", "title": "Root", "screen_name": "s"}},
         "edges": [],
@@ -177,6 +180,7 @@ def test_phase0_determinism_and_immutability(tmp_path: Path):
 
     original_dag = {
         "workflow_name": "ImmutableWorkflow",
+        "target_url": "https://example.com",
         "root_node": "state_root",
         "terminal_node": "state_root",
         "nodes": {
@@ -230,6 +234,7 @@ def test_phase0_templates_no_raw_jinja_and_no_demo_html(tmp_path: Path):
     out_dir = tmp_path / "dist_tmpl_check"
     dag = {
         "workflow_name": "TmplWorkflow",
+        "target_url": "https://example.com",
         "root_node": "state_root",
         "terminal_node": "state_root",
         "nodes": {"state_root": {"id": "state_root", "title": "Root", "screen_name": "s"}},

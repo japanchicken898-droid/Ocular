@@ -154,6 +154,23 @@ def generate_synthetic_screen_recording(
         out.write(frame_dash)
 
     out.release()
+
+    meta_file = output_path.parent / "session_metadata.json"
+    if not meta_file.exists():
+        import json
+        meta_file.write_text(
+            json.dumps(
+                {
+                    "url": "https://example.com/app",
+                    "target_url": "https://example.com/app",
+                    "workflow_name": "SyntheticWorkflow",
+                    "start_timestamp_ms": 1700000000000,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
     return output_path
 
 

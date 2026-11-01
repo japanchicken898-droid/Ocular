@@ -9,6 +9,7 @@ indexed intermediate data structure.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -16,6 +17,7 @@ import cv2
 import numpy as np
 
 from ocular.models.types import ActionType, FrameMetadata, TransitionEvent
+from ocular.telemetry import coerce_telemetry_event
 
 logger = logging.getLogger("ocular.pipeline.video_ingest")
 
@@ -48,7 +50,7 @@ class KeyframeIndex:
         return self.slices.get(frame_index)
 
     def export_slices(self, output_dir: Union[str, Path]) -> List[Path]:
-        """Saves all keyframe image slices to disk."""
+        """Saves all keyframe image slices to disk, verifying write success."""
         out_path = Path(output_dir)
         out_path.mkdir(parents=True, exist_ok=True)
         saved_paths: List[Path] = []
@@ -57,7 +59,9 @@ class KeyframeIndex:
             if frame_arr is not None:
                 fname = f"keyframe_{kf.frame_index:04d}_{int(kf.timestamp_ms)}ms.jpg"
                 fpath = out_path / fname
-                cv2.imwrite(str(fpath), frame_arr)
+                success = cv2.imwrite(str(fpath), frame_arr)
+                if not success:
+                    raise IOError(f"Failed to write keyframe slice image to disk: {fpath}")
                 kf.image_path = str(fpath)
                 saved_paths.append(fpath)
         return saved_paths
@@ -72,6 +76,8 @@ class VideoIngestSampler:
         diff_threshold: float = 0.08,
         idle_threshold: float = 0.015,
         output_frames_dir: Optional[Union[str, Path]] = None,
+        max_frames: int = 2000,
+        max_duration_s: float = 3600.0,
     ) -> None:
         """Initialize the video ingest sampler.
 
@@ -80,6 +86,8 @@ class VideoIngestSampler:
             diff_threshold: Normalized mean absolute pixel difference threshold [0.0, 1.0].
             idle_threshold: Difference threshold below which screen is considered idle/settled.
             output_frames_dir: Optional directory to persist extracted keyframes.
+            max_frames: Upper bound on total keyframes retained in memory.
+            max_duration_s: Upper bound on total processed video duration in seconds.
         """
         self.sample_rate = sample_rate
         self.diff_threshold = diff_threshold
@@ -87,6 +95,8 @@ class VideoIngestSampler:
         self.output_frames_dir = Path(output_frames_dir) if output_frames_dir else None
         if self.output_frames_dir:
             self.output_frames_dir.mkdir(parents=True, exist_ok=True)
+        self.max_frames = max_frames
+        self.max_duration_s = max_duration_s
 
     @staticmethod
     def _compute_frame_diff(
@@ -129,43 +139,29 @@ class VideoIngestSampler:
 
         return diff_score, roi_bbox, motion_energy
 
+    def _sanitize_fps(self, fps: Any) -> float:
+        """Sanitizes frames per second, handling NaN, inf, zero, and clamping to [1.0, 240.0]."""
+        try:
+            val = float(fps)
+            if not math.isfinite(val) or val <= 0.0:
+                return 30.0
+            return min(240.0, max(1.0, val))
+        except (ValueError, TypeError):
+            return 30.0
+
+    def _validate_dimensions(self, width: int, height: int) -> bool:
+        """Validates video resolution bounds to reject absurd or corrupted dimensions."""
+        try:
+            w = int(width)
+            h = int(height)
+            return 0 < w <= 7680 and 0 < h <= 4320
+        except (ValueError, TypeError):
+            return False
+
     @staticmethod
     def coerce_telemetry_event(event: Any) -> Optional[Dict[str, Any]]:
-        """Safely coerces numeric fields in a telemetry event dictionary, rejecting non-dict objects."""
-        if not isinstance(event, dict):
-            return None
-        e = dict(event)
-        # Coerce elapsed_ms safely via int(event.get("elapsed_ms") or 0) inside try ... except
-        try:
-            val = e.get("elapsed_ms")
-            if val is None:
-                raw_ts = e.get("timestamp_ms")
-                val = raw_ts if raw_ts is not None else 0
-            e["elapsed_ms"] = int(float(val) if isinstance(val, str) else (val or 0))
-        except (ValueError, TypeError):
-            e["elapsed_ms"] = 0
-
-        # Coerce timestamp_ms
-        try:
-            val_ts = e.get("timestamp_ms")
-            e["timestamp_ms"] = float(val_ts) if val_ts is not None else float(e["elapsed_ms"])
-        except (ValueError, TypeError):
-            e["timestamp_ms"] = float(e["elapsed_ms"])
-
-        # Coerce norm_x and norm_y coordinates safely via float(...) with fallback to 0.0
-        try:
-            val_x = e.get("norm_x")
-            e["norm_x"] = float(val_x) if val_x is not None else 0.0
-        except (ValueError, TypeError):
-            e["norm_x"] = 0.0
-
-        try:
-            val_y = e.get("norm_y")
-            e["norm_y"] = float(val_y) if val_y is not None else 0.0
-        except (ValueError, TypeError):
-            e["norm_y"] = 0.0
-
-        return e
+        """Safely coerces numeric fields in a telemetry event dictionary using shared module."""
+        return coerce_telemetry_event(event)
 
     def sample_transitions(
         self,
@@ -187,11 +183,14 @@ class VideoIngestSampler:
         if not cap.isOpened():
             raise ValueError(f"Could not open video file: {video_path}")
 
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        fps = self._sanitize_fps(cap.get(cv2.CAP_PROP_FPS))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1920)
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1080)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if not self._validate_dimensions(width, height):
+            cap.release()
+            raise ValueError(f"Invalid video dimensions: {width}x{height}")
 
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         step = max(1, int(round(fps / self.sample_rate)))
 
         sampled_frames: List[np.ndarray] = []
@@ -215,9 +214,18 @@ class VideoIngestSampler:
         ]
 
         while True:
+            if len(sampled_frames) >= self.max_frames:
+                logger.warning(f"Video frame limit ({self.max_frames}) reached; stopping sampling.")
+                break
+
             if frame_idx % step == 0:
                 ret, frame = cap.read()
                 if not ret:
+                    break
+
+                curr_ts_ms = round((frame_idx / fps) * 1000.0, 2)
+                if (curr_ts_ms / 1000.0) >= self.max_duration_s:
+                    logger.warning(f"Video duration limit ({self.max_duration_s}s) reached; stopping sampling.")
                     break
 
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
