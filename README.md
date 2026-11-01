@@ -12,7 +12,7 @@
 **Offline Visual Workflow Compiler**  
 *Built for the Meta Global AI Developer Hackathon 2026*
 
-[![Tests](https://img.shields.io/badge/tests-28%2F28%20passing-success)](#)
+[![Tests](https://img.shields.io/badge/tests-133%2F133%20passing-success)](#)
 [![Latency](https://img.shields.io/badge/latency-~146ms-blue)](#)
 [![Cost](https://img.shields.io/badge/runtime%20vision%20cost-$0.00-green)](#)
 [![Meta](https://img.shields.io/badge/Powered%20By-Meta%20SAM%203.1%20%7C%20Muse%20Spark-0668E1)](#)

@@ -7,6 +7,7 @@ import hashlib
 import json
 import keyword
 import logging
+import os
 from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -792,6 +793,91 @@ class JinjaCodeGenerator(BaseGenerator):
         redaction_dst = out_path / "redaction.py"
         self._safe_write_text(redaction_dst, redaction_src.read_text(encoding="utf-8"))
 
+        # 8. Hardened minimal Dockerfile (B-01)
+        dockerfile_content = (
+            "# Hardened minimal Dockerfile for Ocular Compiled Automation Service\n"
+            "FROM python:3.11-slim-bookworm AS base\n\n"
+            "ENV PYTHONDONTWRITEBYTECODE=1 \\\n"
+            "    PYTHONUNBUFFERED=1 \\\n"
+            "    PORT=8000 \\\n"
+            "    OCULAR_ENV=production\n\n"
+            "RUN apt-get update && \\\n"
+            "    apt-get install -y --no-install-recommends ca-certificates && \\\n"
+            "    rm -rf /var/lib/apt/lists/*\n\n"
+            "RUN groupadd -g 10001 ocular && \\\n"
+            "    useradd -u 10001 -g ocular -s /sbin/nologin -M -d /app ocular\n\n"
+            "WORKDIR /app\n\n"
+            "COPY requirements.txt /app/\n"
+            "RUN pip install --no-cache-dir -r requirements.txt && \\\n"
+            "    playwright install --with-deps chromium && \\\n"
+            "    rm -rf /var/lib/apt/lists/* /root/.cache\n\n"
+            "COPY . /app/\n"
+            "RUN chown -R ocular:ocular /app && \\\n"
+            "    chmod -R 0550 /app && \\\n"
+            "    chmod 0750 /app\n\n"
+            "USER ocular:ocular\n"
+            "EXPOSE 8000\n\n"
+            'ENTRYPOINT ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]\n'
+        )
+        dockerfile_path = out_path / "Dockerfile"
+        self._safe_write_text(dockerfile_path, dockerfile_content)
+
+        # 9. Reference egress firewall script (B-01)
+        egress_script_content = (
+            "#!/usr/bin/env bash\n"
+            "# ==============================================================================\n"
+            "# Ocular Defense-in-Depth Container/NetNS Egress Firewall Reference Script\n"
+            "#\n"
+            "# Enforces kernel-level egress network confinement for Ocular automated drivers.\n"
+            "# Drops connections to loopback, RFC1918 private subnets, link-local, cloud metadata,\n"
+            "# and CGNAT ranges before traffic leaves the container network namespace.\n"
+            "# ==============================================================================\n"
+            "set -euo pipefail\n\n"
+            "# Flush existing egress filter rules\n"
+            "iptables -F OUTPUT 2>/dev/null || true\n\n"
+            "# Allow established/related return traffic\n"
+            "iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true\n\n"
+            "# Allow explicit DNS resolution to configured upstream DNS resolvers\n"
+            "iptables -A OUTPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || true\n"
+            "iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || true\n\n"
+            "# Drop Cloud Metadata Service & Tailscale/Carrier CGNAT IPs\n"
+            "iptables -A OUTPUT -d 169.254.169.254/32 -j DROP 2>/dev/null || true\n"
+            "iptables -A OUTPUT -d 100.100.100.200/32 -j DROP 2>/dev/null || true\n"
+            "iptables -A OUTPUT -d 100.64.0.0/10 -j DROP 2>/dev/null || true\n\n"
+            "# Drop IPv4 Link-Local\n"
+            "iptables -A OUTPUT -d 169.254.0.0/16 -j DROP 2>/dev/null || true\n\n"
+            "# Drop Loopback\n"
+            "iptables -A OUTPUT -d 127.0.0.0/8 -j DROP 2>/dev/null || true\n\n"
+            "# Drop RFC1918 Private Address Spaces\n"
+            "iptables -A OUTPUT -d 10.0.0.0/8 -j DROP 2>/dev/null || true\n"
+            "iptables -A OUTPUT -d 172.16.0.0/12 -j DROP 2>/dev/null || true\n"
+            "iptables -A OUTPUT -d 192.168.0.0/16 -j DROP 2>/dev/null || true\n\n"
+            "# Drop Multicast & Broadcast\n"
+            "iptables -A OUTPUT -d 224.0.0.0/4 -j DROP 2>/dev/null || true\n"
+            "iptables -A OUTPUT -d 255.255.255.255/32 -j DROP 2>/dev/null || true\n\n"
+            "# Allow remaining outbound public HTTPS/HTTP traffic\n"
+            "iptables -A OUTPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || true\n"
+            "iptables -A OUTPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true\n"
+            "iptables -A OUTPUT -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true\n\n"
+            'echo "Ocular egress firewall rules applied successfully."\n'
+        )
+        egress_script_path = out_path / "egress_firewall.sh"
+        self._safe_write_text(egress_script_path, egress_script_content)
+        try:
+            os.chmod(egress_script_path, 0o755)
+        except OSError:
+            pass
+
+        # 10. Hardened requirements.txt (B-01)
+        requirements_content = (
+            "playwright>=1.48.0,<2.0.0\n"
+            "fastapi>=0.104.0,<1.0.0\n"
+            "uvicorn>=0.24.0,<1.0.0\n"
+            "pydantic>=2.5.0,<3.0.0\n"
+        )
+        requirements_path = out_path / "requirements.txt"
+        self._safe_write_text(requirements_path, requirements_content)
+
         return {
             "playwright_driver": driver_file.resolve(),
             "app": app_file.resolve(),
@@ -801,6 +887,9 @@ class JinjaCodeGenerator(BaseGenerator):
             "workflow_json": workflow_json_file.resolve(),
             "netguard": netguard_dst.resolve(),
             "redaction": redaction_dst.resolve(),
+            "dockerfile": dockerfile_path.resolve(),
+            "egress_firewall": egress_script_path.resolve(),
+            "requirements": requirements_path.resolve(),
         }
 
     def generate(

@@ -30,9 +30,22 @@ class OcularSessionRecorder:
     _INIT_SCRIPT_TEMPLATE = r"""
     (() => {
         if (window !== window.top) return;
+        if (window.self !== window.top) return;
         const startTime = performance.now();
         const sessionEpoch = Date.now();
         const SESSION_NONCE = "__SESSION_NONCE__";
+
+        // Private closure binding encapsulation: prevent untrusted page scripts from tampering
+        const _pushTelemetry = window.__ocular_push_telemetry;
+        try {
+            Object.defineProperty(window, '__ocular_push_telemetry', {
+                value: undefined,
+                writable: false,
+                configurable: false
+            });
+        } catch (e) {
+            try { delete window.__ocular_push_telemetry; } catch (e2) {}
+        }
 
         function getElapsedMs() {
             return Math.round(performance.now() - startTime);
@@ -114,8 +127,8 @@ class OcularSessionRecorder:
                 _nonce: SESSION_NONCE,
             };
             try {
-                if (window.__ocular_push_telemetry) {
-                    window.__ocular_push_telemetry(payload);
+                if (_pushTelemetry) {
+                    _pushTelemetry(payload);
                 }
             } catch (err) {
                 console.error('[Ocular Telemetry] Push failed:', err);
@@ -151,8 +164,8 @@ class OcularSessionRecorder:
                 _nonce: SESSION_NONCE,
             };
             try {
-                if (window.__ocular_push_telemetry) {
-                    window.__ocular_push_telemetry(payload);
+                if (_pushTelemetry) {
+                    _pushTelemetry(payload);
                 }
             } catch (err) {
                 console.error('[Ocular Telemetry] Push failed:', err);
@@ -164,7 +177,7 @@ class OcularSessionRecorder:
         "__CLIENT_JS_SENSITIVE_CHECK__", get_client_js_sensitive_check()
     )
 
-    TELEMETRY_INIT_SCRIPT = _INIT_SCRIPT_TEMPLATE.replace("__SESSION_NONCE__", "default_nonce")
+    TELEMETRY_INIT_SCRIPT = _INIT_SCRIPT_TEMPLATE.replace("__SESSION_NONCE__", secrets.token_urlsafe(32))
 
     @property
     def init_script(self) -> str:
@@ -222,7 +235,7 @@ class OcularSessionRecorder:
         self.headless = headless
         self.slow_mo = slow_mo
         self.on_event_callback = on_event_callback
-        self.session_nonce = secrets.token_hex(16)
+        self.session_nonce = secrets.token_urlsafe(32)
         self.telemetry_events: List[Dict[str, Any]] = []
         self.telemetry_path = self.out_dir / "telemetry_events.jsonl"
         self.video_path: Optional[Path] = None
@@ -238,7 +251,21 @@ class OcularSessionRecorder:
         """Truncates arbitrary string attributes and redacts sensitive inputs via unified module."""
         # Whitelist allowed keys
         filtered = {k: v for k, v in event_data.items() if k in self.ALLOWED_EVENT_KEYS}
-        
+
+        # Check and bound coordinates and button
+        if "client_x" in filtered:
+            cx = filtered["client_x"]
+            if not isinstance(cx, (int, float)) or cx < 0:
+                return {}
+        if "client_y" in filtered:
+            cy = filtered["client_y"]
+            if not isinstance(cy, (int, float)) or cy < 0:
+                return {}
+        if "button" in filtered:
+            btn = filtered["button"]
+            if not isinstance(btn, int) or btn < 0 or btn > 10:
+                return {}
+
         # Check for nested containers in string fields
         is_sensitive = is_sensitive_field(filtered)
         for k in self.STRING_FIELDS:
@@ -308,9 +335,24 @@ class OcularSessionRecorder:
             return
 
         self.telemetry_events.append(coerced_event)
-        self.out_dir.mkdir(parents=True, exist_ok=True)
-        with open(self.telemetry_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(coerced_event) + "\n")
+        import os
+        os.makedirs(self.out_dir, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(self.out_dir, 0o700)
+        except OSError:
+            pass
+
+        try:
+            fd = os.open(self.telemetry_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                os.chmod(self.telemetry_path, 0o600)
+            except OSError:
+                pass
+            with open(fd, "a", encoding="utf-8", closefd=True) as f:
+                f.write(json.dumps(coerced_event) + "\n")
+        except Exception as write_err:
+            logger.debug(f"Error writing telemetry event: {write_err}")
+
         if self.on_event_callback:
             try:
                 self.on_event_callback(coerced_event)
@@ -321,11 +363,42 @@ class OcularSessionRecorder:
         """Playwright binding handler called by client-side probe."""
         if not isinstance(event_data, dict):
             return
-        # Verify per-session nonce
+
+        # Top-frame check: reject events originating from subframes
+        if isinstance(source, dict):
+            frame = source.get("frame")
+            page = source.get("page")
+            if frame is not None and page is not None:
+                try:
+                    if frame != page.main_frame:
+                        logger.warning("Rejected telemetry event originating from subframe.")
+                        return
+                except Exception:
+                    pass
+
+        # Strict per-session nonce validation (no default_nonce fallback)
         nonce = event_data.get("_nonce")
-        if self.session_nonce and nonce not in (self.session_nonce, "default_nonce"):
+        if not self.session_nonce or nonce != self.session_nonce:
             logger.warning("Rejected telemetry event with missing or invalid session nonce.")
             return
+
+        # Validate event coordinates and mouse button
+        if "client_x" in event_data:
+            cx = event_data["client_x"]
+            if not isinstance(cx, (int, float)) or cx < 0:
+                logger.warning(f"Rejected telemetry event with invalid client_x: {cx}")
+                return
+        if "client_y" in event_data:
+            cy = event_data["client_y"]
+            if not isinstance(cy, (int, float)) or cy < 0:
+                logger.warning(f"Rejected telemetry event with invalid client_y: {cy}")
+                return
+        if "button" in event_data:
+            btn = event_data["button"]
+            if not isinstance(btn, int) or btn < 0 or btn > 10:
+                logger.warning(f"Rejected telemetry event with invalid button: {btn}")
+                return
+
         self.push_telemetry_event(event_data)
 
     @staticmethod
@@ -346,17 +419,26 @@ class OcularSessionRecorder:
     def _write_session_metadata(self, url: str) -> None:
         start_epoch_ms = int(time.time() * 1000)
         sanitized = self._sanitize_origin(url)
-        self.out_dir.mkdir(parents=True, exist_ok=True)
+        import os
+        os.makedirs(self.out_dir, mode=0o700, exist_ok=True)
         try:
-            (self.out_dir / "session_metadata.json").write_text(
-                json.dumps({
+            os.chmod(self.out_dir, 0o700)
+        except OSError:
+            pass
+        meta_path = self.out_dir / "session_metadata.json"
+        try:
+            fd = os.open(meta_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.chmod(meta_path, 0o600)
+            except OSError:
+                pass
+            with open(fd, "w", encoding="utf-8", closefd=True) as f:
+                f.write(json.dumps({
                     "url": sanitized,
                     "origin": sanitized,
                     "timestamp": time.time(),
                     "start_timestamp_ms": start_epoch_ms,
-                }),
-                encoding="utf-8"
-            )
+                }))
         except Exception:
             pass
 
@@ -367,9 +449,24 @@ class OcularSessionRecorder:
         wait_for_close: bool = True,
     ) -> Dict[str, Any]:
         """Launches browser, sets up telemetry probe, and captures video + events."""
-        self.out_dir.mkdir(parents=True, exist_ok=True)
-        # Initialize empty telemetry file
-        self.telemetry_path.write_text("", encoding="utf-8")
+        import os
+        os.makedirs(self.out_dir, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(self.out_dir, 0o700)
+        except OSError:
+            pass
+
+        # Initialize empty telemetry file with 0o600 permissions
+        try:
+            fd = os.open(self.telemetry_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.close(fd)
+            try:
+                os.chmod(self.telemetry_path, 0o600)
+            except OSError:
+                pass
+        except Exception:
+            self.telemetry_path.write_text("", encoding="utf-8")
+
         self.telemetry_events.clear()
         self.truncated = False
         self._max_warning_logged = False
@@ -388,6 +485,23 @@ class OcularSessionRecorder:
                 record_video_dir=str(self.out_dir),
                 record_video_size={"width": self.viewport_width, "height": self.viewport_height},
             )
+
+            # Apply netguard confinement route guard to recording session
+            from ocular.security.netguard import get_allowed_hosts, setup_confinement_routes
+
+            active_allowed = set(get_allowed_hosts())
+            try:
+                from urllib.parse import urlparse
+                parsed = urlparse(url)
+                if parsed.hostname:
+                    if parsed.port:
+                        active_allowed.add(f"{parsed.hostname.lower()}:{parsed.port}")
+                    else:
+                        active_allowed.add(parsed.hostname.lower())
+            except Exception:
+                pass
+
+            await setup_confinement_routes(context, allowed_hosts=active_allowed)
 
             # Expose telemetry binding and inject listeners
             await context.expose_binding("__ocular_push_telemetry", self._handle_telemetry_binding)
