@@ -61,8 +61,9 @@ def local_app_server():
 
 def test_emitted_fastapi_endpoints(tmp_path: Path, local_app_server: str, monkeypatch):
     monkeypatch.setenv("OCULAR_INSECURE_NO_AUTH", "1")
-    monkeypatch.setenv("OCULAR_ALLOWED_HOSTS", "127.0.0.1")
-    monkeypatch.setenv("OCULAR_ALLOWED_EGRESS_HOSTS", "127.0.0.1")
+    app_host_port = local_app_server.replace("http://", "").rstrip("/")
+    monkeypatch.setenv("OCULAR_ALLOWED_HOSTS", app_host_port)
+    monkeypatch.setenv("OCULAR_ALLOWED_EGRESS_HOSTS", app_host_port)
     video_path = tmp_path / "sample.mp4"
     generate_synthetic_screen_recording(video_path, fps=60, width=1920, height=1080)
 

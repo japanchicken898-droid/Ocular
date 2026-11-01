@@ -1,11 +1,55 @@
+import sys
+import importlib
+from pathlib import Path
 import pytest
 from unittest.mock import AsyncMock, MagicMock
-from dist.playwright_driver import OcularPlaywrightDriver
+
+from ocular.pipeline.code_generator import JinjaCodeGenerator
+
+
+@pytest.fixture
+def driver_cls(tmp_path: Path):
+    dist_dir = tmp_path / "dist"
+    segments = [
+        {
+            "id": "indicators_btn",
+            "label": "indicators_btn",
+            "role": "button",
+            "suggested_selector": "button#indicators_btn",
+            "bbox": {"x": 0.2, "y": 0.04, "width": 0.07, "height": 0.04},
+        }
+    ]
+    dag = {
+        "workflow_name": "HybridTestWorkflow",
+        "target_url": "http://localhost:3000/",
+        "nodes": {"indicators_btn": {"role": "button"}},
+        "edges": [
+            {
+                "from_node": "state_root",
+                "to_node": "indicators_btn",
+                "action_type": "click",
+                "trigger_element": "indicators_btn",
+            }
+        ],
+    }
+    generator = JinjaCodeGenerator()
+    generator.emit(dag=dag, segments=segments, out_dir=dist_dir)
+
+    sys.modules.pop("netguard", None)
+    sys.modules.pop("playwright_driver", None)
+    sys.path.insert(0, str(dist_dir.resolve()))
+    try:
+        mod = importlib.import_module("playwright_driver")
+        yield getattr(mod, "OcularPlaywrightDriver")
+    finally:
+        sys.path.remove(str(dist_dir.resolve()))
+        sys.modules.pop("netguard", None)
+        sys.modules.pop("playwright_driver", None)
 
 
 @pytest.mark.asyncio
-async def test_hybrid_driver_semantic_primary():
-    driver = OcularPlaywrightDriver(viewport_width=1920, viewport_height=1080)
+async def test_hybrid_driver_semantic_primary(driver_cls):
+    driver = driver_cls(viewport_width=1920, viewport_height=1080)
 
     # Mock Page with a matched semantic role locator
     page = MagicMock()
@@ -26,8 +70,8 @@ async def test_hybrid_driver_semantic_primary():
 
 
 @pytest.mark.asyncio
-async def test_hybrid_driver_sam_fallback_when_canvas_or_obfuscated():
-    driver = OcularPlaywrightDriver(viewport_width=1920, viewport_height=1080)
+async def test_hybrid_driver_sam_fallback_when_canvas_or_obfuscated(driver_cls):
+    driver = driver_cls(viewport_width=1920, viewport_height=1080)
 
     # Mock Page where semantic locator fails or returns count 0 (e.g. canvas or obfuscated DOM)
     page = MagicMock()

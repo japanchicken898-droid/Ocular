@@ -170,6 +170,7 @@ class {{ workflow_class_name }}:
         retry_delay_sec: float = 0.15,
         semantic_timeout_ms: int = 1200,
         live: bool = True,
+        blocked_port: Optional[int] = None,
     ) -> None:
         self.base_url = (base_url or self.TARGET_URL).rstrip("/")
         self.viewport_width = viewport_width
@@ -180,6 +181,10 @@ class {{ workflow_class_name }}:
         self.retry_delay_sec = retry_delay_sec
         self.semantic_timeout_ms = semantic_timeout_ms
         self.live = live
+        self.blocked_port = blocked_port or (int(os.environ.get("PORT")) if os.environ.get("PORT") else None)
+
+        if os.environ.get("OCULAR_ENV", "").lower() == "production" and not os.environ.get("OCULAR_EGRESS_PROXY"):
+            raise RuntimeError("OCULAR_ENV=production requires OCULAR_EGRESS_PROXY to be configured.")
 
     def denormalize_target(
         self,
@@ -311,7 +316,7 @@ class {{ workflow_class_name }}:
         pre_url = page.url
         res = await self.click_with_retry(page, px, py, anchor_id)
         res["action"] = "click"
-        res["strategy"] = "visual_fallback"
+        res["strategy"] = "sam_visual_coordinates"
 
         # Verify fallback click postcondition
         verified = (page.url != pre_url)
@@ -457,8 +462,14 @@ class {{ workflow_class_name }}:
                     "args": launch_args,
                 }
                 egress_proxy = os.environ.get("OCULAR_EGRESS_PROXY")
+                if os.environ.get("OCULAR_ENV", "").lower() == "production" and not egress_proxy:
+                    raise RuntimeError("OCULAR_ENV=production requires OCULAR_EGRESS_PROXY to be configured.")
+
                 if egress_proxy:
-                    launch_kwargs["proxy"] = {"server": egress_proxy}
+                    launch_kwargs["proxy"] = {
+                        "server": egress_proxy,
+                        "bypass": "<-loopback>",
+                    }
 
                 if not self.headless:
                     launch_args.append(f"--window-size={self.viewport_width},{self.viewport_height}")
@@ -482,24 +493,28 @@ class {{ workflow_class_name }}:
                     permissions=[],
                 )
 
-                # Browser-level SSRF redirect guard: intercept all context requests
-                async def _ssrf_route_guard(route):
-                    req_url = route.request.url
-                    if is_private_url(req_url, allowed_hosts=get_allowed_hosts()):
-                        logger.warning(f"Blocked browser navigation to private subnet: {req_url}")
-                        await route.abort("blockedbyclient")
-                    else:
-                        await route.continue_()
-
-                await context.route(re.compile(r".*"), _ssrf_route_guard)
-                await setup_confinement_routes(context)
-                page: Page = await context.new_page()
-
                 raw_target_url = (self.base_url or self.TARGET_URL).rstrip("/")
                 try:
                     target_nav_url = canonicalize_url(raw_target_url)
                 except Exception:
                     target_nav_url = raw_target_url
+
+                active_allowed = set(get_allowed_hosts())
+                try:
+                    parsed_tgt = urlparse(target_nav_url)
+                    tgt_host = parsed_tgt.hostname or ""
+                    tgt_port = parsed_tgt.port
+                    if tgt_host and tgt_port:
+                        active_allowed.add(f"{tgt_host.lower()}:{tgt_port}")
+                    elif tgt_host:
+                        active_allowed.add(tgt_host.lower())
+                except Exception:
+                    pass
+
+                # Context-level _ssrf_route_guard delegated to setup_confinement_routes:
+                # await context.route(re.compile(r".*"), ...)
+                await setup_confinement_routes(context, allowed_hosts=active_allowed, blocked_port=self.blocked_port)
+                page: Page = await context.new_page()
 
                 # Step 0: Always navigate to the real target URL (no mock HTML fallback)
                 try:

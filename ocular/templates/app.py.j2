@@ -41,6 +41,8 @@ from netguard import (
     canonicalize_url,
     get_allowed_hosts,
     host_is_blocked,
+    is_host_allowed,
+    is_loopback_or_private_host,
     is_private_url,
     resolve_and_check_host,
 )
@@ -71,7 +73,7 @@ async def validate_safe_url(url: str, allow_local: Optional[bool] = None) -> str
     port = parsed.port
 
     allowed = get_allowed_hosts()
-    if hostname and hostname.lower() in ("localhost", "127.0.0.1", "::1", "0.0.0.0") and hostname.lower() not in allowed:
+    if is_loopback_or_private_host(hostname) and not is_host_allowed(hostname, port, allowed):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Target URL points to blocked loopback address: '{hostname}'."
@@ -386,12 +388,14 @@ async def execute_workflow(
         )
 
     try:
+        app_port = int(os.environ.get("PORT", "8000"))
         req_driver = {{ workflow_class_name }}(
             base_url=req_base_url,
             viewport_width=req_width,
             viewport_height=req_height,
             headless=req_headless,
             live=req_live,
+            blocked_port=app_port,
         )
         run_deadline = min(float(req_timeout) / 1000.0, 120.0)
         try:
