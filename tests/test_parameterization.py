@@ -14,15 +14,109 @@ from ocular.pipeline.code_generator import JinjaCodeGenerator, extract_telemetry
 from samples.create_sample_video import generate_synthetic_screen_recording
 
 
+import asyncio
+import http.server
+import importlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import threading
+import pytest
+from starlette.testclient import TestClient
+
+from ocular.cli import compile_command
+from ocular.pipeline.code_generator import JinjaCodeGenerator, extract_telemetry_input_parameters
+from samples.create_sample_video import generate_synthetic_screen_recording
+
+
+class ParamFixtureHandler(http.server.BaseHTTPRequestHandler):
+    workflow_json_path = None
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        elements = []
+        if self.workflow_json_path and Path(self.workflow_json_path).exists():
+            try:
+                data = json.loads(Path(self.workflow_json_path).read_text(encoding="utf-8"))
+                for aid in data.get("anchors", {}):
+                    elements.append(f'<button id="{aid}" role="button">{aid}</button><input id="{aid}" role="textbox" value="" />')
+                for step in data.get("action_steps", []):
+                    t = step.get("target_anchor", "")
+                    elements.append(f'<button id="{t}" role="button">{t}</button><input id="{t}" role="textbox" value="" />')
+            except Exception:
+                pass
+        elements_html = "\n".join(elements)
+        html = f"""<!DOCTYPE html>
+<html>
+<head><title>Parameterization Real Fixture</title></head>
+<body>
+    <button id="btn_submit" role="button">Submit</button>
+    <input id="input_query" role="textbox" name="query" value="" />
+    <button id="interval_dropdown" role="button">Interval</button>
+    <button id="timeframe_15m" role="button">15m</button>
+    {elements_html}
+</body>
+</html>"""
+        self.wfile.write(html.encode("utf-8"))
+
+    def log_message(self, format, *args):
+        pass
+
+
 @pytest.fixture(scope="module")
-def compiled_test_dist(tmp_path_factory):
+def param_fixture_server():
+    server = http.server.HTTPServer(("127.0.0.1", 0), ParamFixtureHandler)
+    port = server.server_port
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{port}"
+    server.shutdown()
+    server.server_close()
+
+
+@pytest.fixture(scope="module")
+def compiled_test_dist(tmp_path_factory, param_fixture_server: str):
+    old_hosts = os.environ.get("OCULAR_ALLOWED_HOSTS")
+    old_egress = os.environ.get("OCULAR_ALLOWED_EGRESS_HOSTS")
+    old_auth = os.environ.get("OCULAR_INSECURE_NO_AUTH")
+
+    os.environ["OCULAR_INSECURE_NO_AUTH"] = "1"
+    os.environ["OCULAR_ALLOWED_HOSTS"] = "127.0.0.1"
+    os.environ["OCULAR_ALLOWED_EGRESS_HOSTS"] = "127.0.0.1"
     tmp_path = tmp_path_factory.mktemp("param_test")
     video_path = tmp_path / "sample.mp4"
     generate_synthetic_screen_recording(video_path, fps=30, width=1920, height=1080)
     dist_dir = tmp_path / "dist"
     ret = compile_command(input_path=str(video_path), out_dir=str(dist_dir))
     assert ret == 0
-    return dist_dir
+
+    wf_file = dist_dir / "workflow.json"
+    if wf_file.exists():
+        wf_data = json.loads(wf_file.read_text(encoding="utf-8"))
+        wf_data["target_url"] = param_fixture_server
+        wf_file.write_text(json.dumps(wf_data, indent=2), encoding="utf-8")
+
+    ParamFixtureHandler.workflow_json_path = dist_dir / "workflow.json"
+    yield dist_dir
+
+    if old_hosts is not None:
+        os.environ["OCULAR_ALLOWED_HOSTS"] = old_hosts
+    else:
+        os.environ.pop("OCULAR_ALLOWED_HOSTS", None)
+
+    if old_egress is not None:
+        os.environ["OCULAR_ALLOWED_EGRESS_HOSTS"] = old_egress
+    else:
+        os.environ.pop("OCULAR_ALLOWED_EGRESS_HOSTS", None)
+
+    if old_auth is not None:
+        os.environ["OCULAR_INSECURE_NO_AUTH"] = old_auth
+    else:
+        os.environ.pop("OCULAR_INSECURE_NO_AUTH", None)
 
 
 def test_pydantic_schema_generation_from_dag(compiled_test_dist: Path):

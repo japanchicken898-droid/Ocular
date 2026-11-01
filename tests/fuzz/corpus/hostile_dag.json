@@ -1,0 +1,40 @@
+[
+  {
+    "workflow_name": "CycleDAG",
+    "nodes": {
+      "node_a": {"id": "node_a", "label": "A"},
+      "node_b": {"id": "node_b", "label": "B"}
+    },
+    "edges": [
+      {"from_node": "node_a", "to_node": "node_b", "action_type": "click"},
+      {"from_node": "node_b", "to_node": "node_a", "action_type": "click"}
+    ]
+  },
+  {
+    "workflow_name": "NegativeTimeoutDAG",
+    "nodes": {
+      "node_a": {"id": "node_a", "label": "A"}
+    },
+    "edges": [
+      {"from_node": "state_root", "to_node": "node_a", "action_type": "click", "timeout_ms": -500}
+    ]
+  },
+  {
+    "workflow_name": "ExcessiveTimeoutDAG",
+    "nodes": {
+      "node_a": {"id": "node_a", "label": "A"}
+    },
+    "edges": [
+      {"from_node": "state_root", "to_node": "node_a", "action_type": "click", "timeout_ms": 999999999}
+    ]
+  },
+  {
+    "workflow_name": "InjectionIdentifierDAG",
+    "nodes": {
+      "invalid id with spaces": {"id": "invalid id with spaces", "label": "Bad ID"}
+    },
+    "edges": [
+      {"from_node": "state_root", "to_node": "invalid id with spaces", "action_type": "click"}
+    ]
+  }
+]

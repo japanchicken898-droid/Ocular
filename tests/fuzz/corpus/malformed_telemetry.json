@@ -1,0 +1,10 @@
+[
+  {"event_type": "mousedown", "norm_x": "NaN", "norm_y": "Infinity", "elapsed_ms": -100},
+  {"event_type": "keydown", "key": "\u0000\u0001\u001f\u007f", "norm_x": 999999.0, "norm_y": -500.0},
+  {"event_type": "mousemove", "norm_x": null, "norm_y": false},
+  {"event_type": "unknown_type", "payload": {"a": [1, 2, 3]}},
+  {"event_type": 12345, "norm_x": "not_a_number"},
+  {},
+  {"event_type": "keydown", "key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+  {"event_type": "mousedown", "target_selector": "<script>alert(1)</script>", "norm_x": 0.5, "norm_y": 0.5}
+]

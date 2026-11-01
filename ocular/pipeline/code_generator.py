@@ -373,11 +373,34 @@ class JinjaCodeGenerator(BaseGenerator):
 
     @staticmethod
     def _safe_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
-        """Safely writes content to target path, rejecting or unlinking existing symlinks to prevent symlink traversal attacks."""
-        if path.is_symlink():
-            logger.warning(f"Rejecting existing symlink at {path}; unlinking before write.")
-            path.unlink()
-        path.write_text(content, encoding=encoding)
+        """Safely writes content to target path atomically with strict permissions, refusing symlinks."""
+        import os
+        import uuid
+
+        if path.is_symlink() or os.path.islink(path):
+            raise IOError(f"Refusing to write to symlink at {path}")
+
+        target_dir = path.parent
+        target_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(target_dir, 0o700)
+        except Exception:
+            pass
+
+        tmp_path = target_dir / f".tmp_{path.name}_{uuid.uuid4().hex}"
+        try:
+            tmp_path.write_text(content, encoding=encoding)
+            try:
+                os.chmod(tmp_path, 0o600)
+            except Exception:
+                pass
+            os.replace(tmp_path, path)
+        finally:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
 
     def _compute_hash(self, dag: Dict[str, Any], segments: List[Dict[str, Any]]) -> str:
         payload = json.dumps({"dag": dag, "segments": segments}, sort_keys=True)

@@ -319,7 +319,7 @@ def test_mermaid_sanitization_and_symlink_defense(tmp_path: Path):
     assert "\x00" not in diagram
     assert "\\" not in diagram
 
-    # 2. Symlink write defense
+    # 2. Symlink write defense: refuse to write to symlink (F21)
     out_dir = tmp_path / "symlink_test_dist"
     out_dir.mkdir(parents=True, exist_ok=True)
     target_hijack = tmp_path / "hijacked.txt"
@@ -329,10 +329,10 @@ def test_mermaid_sanitization_and_symlink_defense(tmp_path: Path):
     symlink_driver.symlink_to(target_hijack)
 
     generator = JinjaCodeGenerator()
-    generator.emit(dag={"workflow_name": "Test", "target_url": "https://example.com"}, segments=[], out_dir=out_dir)
+    with pytest.raises(IOError, match="Refusing to write to symlink"):
+        generator.emit(dag={"workflow_name": "Test", "target_url": "https://example.com"}, segments=[], out_dir=out_dir)
 
-    # Symlink must be unlinked and original hijacked file untouched
-    assert not symlink_driver.is_symlink()
+    # Hijacked target file must remain untouched
     assert target_hijack.read_text() == "original content"
 
 

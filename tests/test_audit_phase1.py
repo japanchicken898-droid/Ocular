@@ -249,7 +249,8 @@ def test_secrets_never_appear_in_any_emitted_file(tmp_path: Path):
         driver_cls = getattr(driver_module, "SecretsTestWorkflow")
         driver = driver_cls(headless=True)
         res = asyncio.run(driver.execute_workflow(params={"field_98124": super_secret_pw}))
-        assert res["success"] is True
+        # F4 Truthful Execution: Against unreachable target, execution fails honestly without fabricated success
+        assert res["status"] in ("success", "error")
         # Secrets should not be echoed in driver results
         for secret in all_secrets:
             assert secret not in json.dumps(res)
@@ -310,7 +311,8 @@ def test_fastapi_schema_and_echo_redaction(tmp_path: Path):
 
         # 2. POST /api/v1/execute must not echo secret parameter values
         resp_exec = client.post("/api/v1/execute", json={"pwd_input": "VerySecretPassword123!"})
-        assert resp_exec.status_code == 200
+        # F4 Truthful Execution: Against unreachable target, maps error truthfully to 500
+        assert resp_exec.status_code in (200, 500)
         body = resp_exec.json()
         body_str = json.dumps(body)
         assert "VerySecretPassword123!" not in body_str

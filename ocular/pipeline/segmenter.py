@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
+from urllib.parse import urlparse
 import urllib.parse
 import urllib.request
 import cv2
@@ -391,7 +392,24 @@ class MetaSAMSegmenter(BaseSegmenter):
         if not api_key:
             return None
 
+        # External inference must be explicitly authorized
+        if os.environ.get("OCULAR_ALLOW_EXTERNAL_INFERENCE") != "1":
+            logger.info("External inference not authorized via OCULAR_ALLOW_EXTERNAL_INFERENCE=1; using local segmentation.")
+            return None
+
         endpoint = os.environ.get("META_MODEL_API_ENDPOINT", "https://api.meta.ai/v1/responses")
+        parsed = urlparse(endpoint)
+        if parsed.scheme.lower() != "https":
+            logger.warning(f"Insecure endpoint scheme '{parsed.scheme}' rejected for META_MODEL_API_ENDPOINT.")
+            raise ValueError(f"Insecure endpoint scheme '{parsed.scheme}' rejected for META_MODEL_API_ENDPOINT: {endpoint}")
+
+        allowed_api_hosts_env = os.environ.get("OCULAR_ALLOWED_API_HOSTS", "")
+        if allowed_api_hosts_env:
+            allowed_api_hosts = {h.strip().lower() for h in allowed_api_hosts_env.split(",") if h.strip()}
+            if parsed.hostname and parsed.hostname.lower() not in allowed_api_hosts:
+                logger.warning(f"Endpoint host '{parsed.hostname}' not in OCULAR_ALLOWED_API_HOSTS.")
+                raise ValueError(f"Endpoint host '{parsed.hostname}' not in OCULAR_ALLOWED_API_HOSTS: {endpoint}")
+
         try:
             h, w = frame.shape[:2]
             _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])

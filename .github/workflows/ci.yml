@@ -1,0 +1,40 @@
+name: Ocular Security & Quality CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    name: Test & Confinement Verification (Python 3.11)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest pytest-asyncio pytest-cov httpx starlette fastapi uvicorn playwright
+
+      - name: Install Playwright Chromium with system dependencies
+        run: |
+          playwright install --with-deps chromium
+
+      - name: Run security & regression test suite
+        env:
+          OCULAR_ALLOWED_HOSTS: "127.0.0.1,localhost"
+          OCULAR_ALLOWED_EGRESS_HOSTS: "127.0.0.1,localhost"
+        run: |
+          pytest -v
+

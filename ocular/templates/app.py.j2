@@ -20,11 +20,12 @@ from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlparse
 import uuid
 
-from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from typing import Any, Dict, List, Optional, Union, Type
 from pydantic import BaseModel, Field, ValidationError, create_model, ConfigDict
+import secrets
 
 _BASE_DIR = Path(__file__).resolve().parent
 if str(_BASE_DIR) not in sys.path:
@@ -103,13 +104,32 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# CORS Configuration: Disallow credentials with wildcard origins to prevent credential leakage
+# Authentication dependency
+def verify_api_key(request: Request) -> None:
+    expected_key = os.environ.get("OCULAR_API_KEY")
+    insecure_no_auth = os.environ.get("OCULAR_INSECURE_NO_AUTH") == "1"
+    if not expected_key:
+        if insecure_no_auth:
+            return
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required: OCULAR_API_KEY is not configured.",
+        )
+    provided_key = request.headers.get("X-API-Key", "")
+    if not provided_key or not secrets.compare_digest(provided_key, expected_key):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing X-API-Key header.",
+        )
+
+
+# CORS Configuration: Default empty allowlist to prevent unauthorized cross-origin requests
 _allowed_origins_env = os.environ.get("ALLOWED_ORIGINS", "")
 if _allowed_origins_env:
     allowed_origins = [o.strip() for o in _allowed_origins_env.split(",") if o.strip()]
     allow_credentials = True
 else:
-    allowed_origins = ["*"]
+    allowed_origins = []
     allow_credentials = False
 
 app.add_middleware(
@@ -126,7 +146,7 @@ MAX_REQUEST_BODY_BYTES = int(os.environ.get("OCULAR_MAX_BODY_SIZE_BYTES", str(2 
 
 @app.middleware("http")
 async def limit_request_body_size(request: Request, call_next):
-    """Enforces request payload size limits against DoS payload attacks."""
+    """Enforces request payload size limits against DoS payload attacks, supporting chunked streaming."""
     if request.method == "POST" and request.url.path.endswith("/api/v1/execute"):
         content_length = request.headers.get("content-length")
         if content_length:
@@ -140,13 +160,25 @@ async def limit_request_body_size(request: Request, call_next):
             except ValueError:
                 pass
 
-        body = await request.body()
-        if len(body) > MAX_REQUEST_BODY_BYTES:
-            return Response(
-                content=json.dumps({"detail": f"Request body exceeds maximum permitted size of {MAX_REQUEST_BODY_BYTES} bytes."}),
-                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                media_type="application/json",
-            )
+        body_chunks = []
+        total_bytes = 0
+        async for chunk in request.stream():
+            total_bytes += len(chunk)
+            if total_bytes > MAX_REQUEST_BODY_BYTES:
+                return Response(
+                    content=json.dumps({"detail": f"Request body exceeds maximum permitted size of {MAX_REQUEST_BODY_BYTES} bytes."}),
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    media_type="application/json",
+                )
+            body_chunks.append(chunk)
+
+        full_body = b"".join(body_chunks)
+        request._body = full_body
+
+        async def receive():
+            return {"type": "http.request", "body": full_body, "more_body": False}
+
+        request._receive = receive
 
     return await call_next(request)
 
@@ -161,30 +193,66 @@ def _is_sensitive_identifier(val: Any) -> bool:
     return bool(re.search(pattern, text, re.IGNORECASE))
 
 
+def _sanitize_error_message(err: str) -> str:
+    """Removes file paths, internal IPs, and raw stack traces from user-facing error messages."""
+    if not err:
+        return "Workflow execution failed."
+    err = re.sub(r'Traceback \(most recent call last\):.*?\n(?=[a-zA-Z0-9_]+:)', '', err, flags=re.DOTALL)
+    err = re.sub(r'File ".*?", line \d+, in .*', '', err)
+    err = re.sub(r'(?:/|[a-zA-Z]:\\)[\w\-./\\]+', '[PATH]', err)
+    err = re.sub(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', '[HOST]', err)
+    if "Connection refused" in err or "ERR_CONNECTION_REFUSED" in err or "failed to connect" in err.lower():
+        return "Connection to target service failed or unreachable."
+    if "Timeout" in err or "timed out" in err.lower():
+        return "Operation timed out."
+    if "HTTP 4" in err or "HTTP 5" in err:
+        return "Target service returned an error status."
+    if "postcondition verification failed" in err:
+        return "Step postcondition verification failed."
+    return "Workflow execution encountered an error."
+
+
+RESERVED_FIELD_NAMES = {
+    "dict", "json", "copy", "parse_obj", "schema", "validate",
+    "model_config", "model_dump", "model_fields", "model_extra",
+}
+
+
 def _build_execution_payload_model() -> Type[BaseModel]:
     schema = getattr({{ workflow_class_name }}, "PARAMETERS_SCHEMA", {}) or {}
     props = schema.get("properties", {})
     field_defs = {
-        "viewport_width": (int, Field(default=1280, description="Browser viewport width in pixels")),
-        "viewport_height": (int, Field(default=720, description="Browser viewport height in pixels")),
+        "viewport_width": (int, Field(default=1280, ge=200, le=3840, description="Browser viewport width in pixels")),
+        "viewport_height": (int, Field(default=720, ge=200, le=2160, description="Browser viewport height in pixels")),
         "headless": (bool, Field(default=True, description="Whether to run browser in headless mode")),
-        "timeout_ms": (int, Field(default=10000, description="Execution timeout in milliseconds")),
+        "timeout_ms": (int, Field(default=10000, ge=1000, le=120000, description="Execution timeout in milliseconds")),
     }
     type_map = {"integer": int, "number": float, "boolean": bool, "string": str}
     for p_name, p_meta in props.items():
-        if p_name not in field_defs:
-            p_type_str = p_meta.get("type", "string")
-            py_t = type_map.get(p_type_str, str)
-            def_val = None if _is_sensitive_identifier(p_name) else p_meta.get("default", None)
-            field_defs[p_name] = (Optional[py_t], Field(default=def_val, description=p_meta.get("description", "")))
-    return create_model("ExecutionPayload", **field_defs, __config__=ConfigDict(extra="allow"))
+        p_type_str = p_meta.get("type", "string")
+        py_t = type_map.get(p_type_str, str)
+        def_val = None if _is_sensitive_identifier(p_name) else p_meta.get("default", None)
+
+        field_name = f"param_{p_name}" if (p_name in RESERVED_FIELD_NAMES or p_name.startswith("_")) else p_name
+        alias_name = p_name if field_name != p_name else None
+
+        if field_name not in field_defs:
+            field_kwargs = {
+                "default": def_val,
+                "description": p_meta.get("description", ""),
+            }
+            if alias_name:
+                field_kwargs["alias"] = alias_name
+            field_defs[field_name] = (Optional[py_t], Field(**field_kwargs))
+
+    return create_model("ExecutionPayload", **field_defs, __config__=ConfigDict(extra="forbid", populate_by_name=True))
 
 
 ExecutionPayload = _build_execution_payload_model()
 
 
 class ExecuteWorkflowRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
     workflow_name: Optional[str] = Field(default=None, description="Target workflow name")
     parameters: Optional[Dict[str, Any]] = Field(
@@ -192,11 +260,11 @@ class ExecuteWorkflowRequest(BaseModel):
         description="Dynamic execution parameters"
     )
     base_url: Optional[str] = Field(default=None, description="Application root URL override")
-    viewport_width: Optional[int] = Field(default=1280, description="Viewport width")
-    viewport_height: Optional[int] = Field(default=720, description="Viewport height")
+    viewport_width: Optional[int] = Field(default=1280, ge=200, le=3840, description="Viewport width")
+    viewport_height: Optional[int] = Field(default=720, ge=200, le=2160, description="Viewport height")
     headless: bool = Field(default=True, description="Headless browser flag")
-    live: bool = Field(default=False, description="Whether to execute directly against live target URL")
-    timeout_ms: int = Field(default=10000, description="Timeout in milliseconds")
+    live: bool = Field(default=True, description="Whether to execute directly against live target URL")
+    timeout_ms: int = Field(default=10000, ge=1000, le=120000, description="Timeout in milliseconds")
 
 
 class ExecuteWorkflowResponse(BaseModel):
@@ -225,7 +293,7 @@ async def health() -> Dict[str, Any]:
     }
 
 
-@app.get("/api/v1/schema", tags=["System"])
+@app.get("/api/v1/schema", tags=["System"], dependencies=[Depends(verify_api_key)])
 async def get_parameters_schema() -> Dict[str, Any]:
     """Returns the parameterized dynamic inputs schema and visual anchors registry."""
     schema_dict = ExecutionPayload.model_json_schema()
@@ -258,7 +326,7 @@ async def get_parameters_schema() -> Dict[str, Any]:
     }
 
 
-@app.post("/api/v1/execute", response_model=ExecuteWorkflowResponse, tags=["Execution"])
+@app.post("/api/v1/execute", response_model=ExecuteWorkflowResponse, tags=["Execution"], dependencies=[Depends(verify_api_key)])
 async def execute_workflow(
     payload: Union[ExecuteWorkflowRequest, ExecutionPayload],
     response: Response
@@ -271,12 +339,13 @@ async def execute_workflow(
     req_width = 1280
     req_height = 720
     req_headless = True
-    req_live = False
+    req_live = True
+    req_timeout = 10000
 
     if isinstance(payload, ExecuteWorkflowRequest):
-        if payload.viewport_width and payload.viewport_height:
-            req_width = payload.viewport_width
-            req_height = payload.viewport_height
+        req_width = payload.viewport_width
+        req_height = payload.viewport_height
+        req_timeout = payload.timeout_ms
         if payload.base_url:
             req_base_url = await validate_safe_url(payload.base_url)
         req_headless = payload.headless
@@ -297,6 +366,7 @@ async def execute_workflow(
         req_width = raw_dict.get("viewport_width", 1280)
         req_height = raw_dict.get("viewport_height", 720)
         req_headless = raw_dict.get("headless", True)
+        req_timeout = raw_dict.get("timeout_ms", 10000)
     else:
         try:
             typed_payload = ExecutionPayload()
@@ -306,7 +376,16 @@ async def execute_workflow(
                 detail=val_exc.errors(),
             )
 
-    async with _execution_semaphore:
+    queue_timeout_sec = float(os.environ.get("OCULAR_QUEUE_TIMEOUT_SEC", "5.0"))
+    try:
+        await asyncio.wait_for(_execution_semaphore.acquire(), timeout=queue_timeout_sec)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Server queue saturated. Try again later.",
+        )
+
+    try:
         req_driver = {{ workflow_class_name }}(
             base_url=req_base_url,
             viewport_width=req_width,
@@ -314,56 +393,60 @@ async def execute_workflow(
             headless=req_headless,
             live=req_live,
         )
+        run_deadline = min(float(req_timeout) / 1000.0, 120.0)
         try:
-            result = await req_driver.execute_workflow(params=typed_payload.model_dump())
-            latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
-
-            response.headers["X-Ocular-Compile-Hash"] = COMPILE_HASH
-            response.headers["X-Execution-Latency-MS"] = str(latency_ms)
-
-            steps = result.get("steps", [])
-            success_status = result.get("success", result.get("status") == "success")
-            err_msg = [result["error"]] if ("error" in result and not success_status) else None
-            return ExecuteWorkflowResponse(
-                success=success_status,
-                execution_id=execution_id,
-                workflow_name=WORKFLOW_NAME,
-                compile_hash=COMPILE_HASH,
-                latency_ms=latency_ms,
-                steps_executed=len(steps),
-                results=result,
-                errors=err_msg,
+            result = await asyncio.wait_for(
+                req_driver.execute_workflow(params=typed_payload.model_dump(by_alias=True)),
+                timeout=run_deadline,
             )
-        except Exception as exc:
-            latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
-            response.headers["X-Ocular-Compile-Hash"] = COMPILE_HASH
-            response.headers["X-Execution-Latency-MS"] = str(latency_ms)
+        except asyncio.TimeoutError:
+            result = {
+                "status": "error",
+                "success": False,
+                "error": "Execution deadline exceeded",
+                "steps": [],
+            }
 
-            return ExecuteWorkflowResponse(
-                success=False,
-                execution_id=execution_id,
-                workflow_name=WORKFLOW_NAME,
-                compile_hash=COMPILE_HASH,
-                latency_ms=latency_ms,
-                steps_executed=0,
-                results={},
-                errors=[str(exc)],
-            )
-        except Exception as exc:
-            latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
-            response.headers["X-Ocular-Compile-Hash"] = COMPILE_HASH
-            response.headers["X-Execution-Latency-MS"] = str(latency_ms)
+        latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+        response.headers["X-Ocular-Compile-Hash"] = COMPILE_HASH
+        response.headers["X-Execution-Latency-MS"] = str(latency_ms)
 
-            return ExecuteWorkflowResponse(
-                success=False,
-                execution_id=execution_id,
-                workflow_name=WORKFLOW_NAME,
-                compile_hash=COMPILE_HASH,
-                latency_ms=latency_ms,
-                steps_executed=0,
-                results={},
-                errors=[str(exc)],
-            )
+        steps = result.get("steps", [])
+        success_status = result.get("success", result.get("status") == "success")
+        raw_err = result.get("error")
+        sanitized_err = None
+        if not success_status:
+            sanitized_err = [_sanitize_error_message(raw_err or "Execution failed")]
+            response.status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+
+        return ExecuteWorkflowResponse(
+            success=success_status,
+            execution_id=execution_id,
+            workflow_name=WORKFLOW_NAME,
+            compile_hash=COMPILE_HASH,
+            latency_ms=latency_ms,
+            steps_executed=len(steps),
+            results=result,
+            errors=sanitized_err,
+        )
+    except Exception as exc:
+        latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+        response.headers["X-Ocular-Compile-Hash"] = COMPILE_HASH
+        response.headers["X-Execution-Latency-MS"] = str(latency_ms)
+        response.status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+
+        return ExecuteWorkflowResponse(
+            success=False,
+            execution_id=execution_id,
+            workflow_name=WORKFLOW_NAME,
+            compile_hash=COMPILE_HASH,
+            latency_ms=latency_ms,
+            steps_executed=0,
+            results={},
+            errors=[_sanitize_error_message(str(exc))],
+        )
+    finally:
+        _execution_semaphore.release()
 
 
 if __name__ == "__main__":

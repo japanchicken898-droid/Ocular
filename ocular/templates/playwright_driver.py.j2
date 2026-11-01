@@ -145,17 +145,15 @@ class {{ workflow_class_name }}:
     PARAMETERS_SCHEMA = _WORKFLOW_DATA.get("parameters_schema", {})
 
     def _build_mock_html(self) -> str:
-        """Dynamically generates offline mock HTML for visual anchors at runtime."""
+        """Offline canvas inspector template for visual anchors."""
         import html
         elements = "\n".join(
             f'<div id="{html.escape(str(k))}" style="position: absolute; left: {round(float(a.get("norm_x", 0.5)) * 100, 2)}%; top: {round(float(a.get("norm_y", 0.5)) * 100, 2)}%;">{html.escape(str(k))}</div>'
             for k, a in self.ANCHORS.items()
         )
-        style_str = "* { box-sizing: border-box; margin: 0; padding: 0; } html, body { width: 100vw; height: 100vh; overflow: hidden; position: relative; background: #0f172a; color: #f8fafc; font-family: sans-serif; }"
         return (
             "<!DOCTYPE html>\n<html>\n<head>\n    <meta charset=\"utf-8\">\n"
-            f"    <title>{html.escape(self.WORKFLOW_NAME)} - Offline Mock</title>\n"
-            f"    <style>{style_str}</style>\n"
+            f"    <title>{html.escape(self.WORKFLOW_NAME)}</title>\n"
             f"</head>\n<body>\n{elements}\n</body>\n</html>"
         )
 
@@ -169,7 +167,7 @@ class {{ workflow_class_name }}:
         max_retries: int = 3,
         retry_delay_sec: float = 0.15,
         semantic_timeout_ms: int = 1200,
-        live: bool = False,
+        live: bool = True,
     ) -> None:
         self.base_url = (base_url or self.TARGET_URL).rstrip("/")
         self.viewport_width = viewport_width
@@ -276,8 +274,20 @@ class {{ workflow_class_name }}:
             if locator is not None and await locator.count() > 0:
                 target_elem = locator.first
                 await target_elem.wait_for(state="visible", timeout=step_timeout)
+                pre_url = page.url
                 await target_elem.click(timeout=step_timeout)
                 logger.info(f"Primary semantic accessibility click succeeded for '{anchor_id}' (role={aria_role})")
+
+                # Verify click postcondition
+                verified = False
+                try:
+                    if page.url != pre_url:
+                        verified = True
+                    else:
+                        verified = await target_elem.is_visible() or (page.url != pre_url)
+                except Exception:
+                    verified = True
+
                 return {
                     "anchor": anchor_id,
                     "action": "click",
@@ -285,19 +295,30 @@ class {{ workflow_class_name }}:
                     "role": aria_role or role,
                     "label": label,
                     "success": True,
+                    "verified": verified,
                 }
         except Exception as sem_exc:
             logger.debug(
                 f"Semantic accessibility target failed for '{anchor_id}' ({sem_exc}); "
-                "seamlessly falling back to Meta SAM 3.1 visual coordinates."
+                "seamlessly falling back to visual coordinates."
             )
 
-        # 2. Resilient Fallback: Meta SAM 3.1 Visual Coordinates
-        logger.info(f"Executing Meta SAM 3.1 visual coordinate fallback for '{anchor_id}'")
+        # 2. Resilient Fallback: Visual Coordinates
+        logger.info(f"Executing visual coordinate fallback for '{anchor_id}'")
         px, py = self.denormalize_target(anchor_id, norm_x=norm_x, norm_y=norm_y)
+        pre_url = page.url
         res = await self.click_with_retry(page, px, py, anchor_id)
         res["action"] = "click"
-        res["strategy"] = "sam_visual_coordinates"
+        res["strategy"] = "visual_fallback"
+
+        # Verify fallback click postcondition
+        verified = (page.url != pre_url)
+        if not verified:
+            try:
+                verified = await page.evaluate("() => document.activeElement !== document.body")
+            except Exception:
+                verified = True
+        res["verified"] = verified
         return res
 
     async def fill_target(
@@ -348,35 +369,56 @@ class {{ workflow_class_name }}:
                 await target_elem.fill(str(value), timeout=step_timeout)
                 logger.info(f"Primary semantic accessibility fill succeeded for '{anchor_id}'")
                 emitted_val = "[REDACTED]" if (_is_sensitive_identifier(anchor_id) or _is_sensitive_identifier(selector)) else str(value)
+
+                # Verify fill postcondition
+                try:
+                    val_check = await target_elem.input_value()
+                    verified = (val_check == str(value))
+                except Exception:
+                    verified = False
+
                 return {
                     "anchor": anchor_id,
                     "action": "fill",
                     "value": emitted_val,
                     "strategy": "semantic_accessibility",
                     "success": True,
+                    "verified": verified,
                 }
         except Exception as sem_exc:
             logger.debug(
                 f"Semantic accessibility fill failed for '{anchor_id}' ({sem_exc}); "
-                "seamlessly falling back to Meta SAM 3.1 visual coordinates."
+                "seamlessly falling back to visual coordinates."
             )
 
-        # 2. Resilient Fallback: Meta SAM 3.1 Visual Coordinates + Keyboard
-        logger.info(f"Executing Meta SAM 3.1 visual coordinate fill fallback for '{anchor_id}'")
+        # 2. Resilient Fallback: Visual Coordinates + Keyboard
+        logger.info(f"Executing visual coordinate fill fallback for '{anchor_id}'")
         px, py = self.denormalize_target(anchor_id, norm_x=norm_x, norm_y=norm_y)
         await self.click_with_retry(page, px, py, anchor_id)
         await asyncio.sleep(0.05)
-        await page.keyboard.press("Meta+A")
+        await page.keyboard.press("ControlOrMeta+A")
         await page.keyboard.press("Backspace")
         await page.keyboard.type(str(value), delay=15)
         emitted_val = "[REDACTED]" if (_is_sensitive_identifier(anchor_id) or _is_sensitive_identifier(selector)) else str(value)
+
+        # Verify fallback fill postcondition
+        verified = False
+        try:
+            active_val = await page.evaluate(
+                "() => document.activeElement ? (document.activeElement.value || document.activeElement.innerText || '') : ''"
+            )
+            verified = (str(value) in active_val)
+        except Exception:
+            verified = False
+
         return {
             "anchor": anchor_id,
             "action": "fill",
             "value": emitted_val,
             "pixel_coordinates": {"x": px, "y": py},
-            "strategy": "sam_visual_coordinates",
+            "strategy": "visual_fallback",
             "success": True,
+            "verified": verified,
         }
 
     async def assert_element_bounds(self, anchor_id: str) -> bool:
@@ -441,7 +483,7 @@ class {{ workflow_class_name }}:
                 # Browser-level SSRF redirect guard: intercept all context requests
                 async def _ssrf_route_guard(route):
                     req_url = route.request.url
-                    if is_private_url(req_url):
+                    if is_private_url(req_url, allowed_hosts=get_allowed_hosts()):
                         logger.warning(f"Blocked browser navigation to private subnet: {req_url}")
                         await route.abort("blockedbyclient")
                     else:
@@ -457,26 +499,37 @@ class {{ workflow_class_name }}:
                 except Exception:
                     target_nav_url = raw_target_url
 
-                # Step 0: Directly load canvas content if offline to prevent error flash
-                if self.live:
-                    try:
-                        await page.goto(target_nav_url, wait_until="domcontentloaded", timeout=self.semantic_timeout_ms)
-                    except Exception as nav_exc:
-                        await browser.close()
-                        return _redact_workflow_results({
-                            "status": "error",
-                            "success": False,
-                            "error": f"Live connection to '{target_nav_url}' failed: {nav_exc}",
-                            "workflow": self.WORKFLOW_NAME,
-                            "parameters": active_inputs,
-                            "latency_ms": round((time.perf_counter() - t_start) * 1000.0, 2),
-                            "steps": [],
-                            "compile_hash": self.COMPILE_HASH,
-                        })
-                else:
-                    await page.set_content(self._build_mock_html(), wait_until="domcontentloaded")
+                # Step 0: Always navigate to the real target URL (no mock HTML fallback)
+                try:
+                    response = await page.goto(target_nav_url, wait_until="domcontentloaded", timeout=self.semantic_timeout_ms)
+                except Exception as nav_exc:
+                    return _redact_workflow_results({
+                        "status": "error",
+                        "success": False,
+                        "error": f"Live connection to '{target_nav_url}' failed: {nav_exc}",
+                        "workflow": self.WORKFLOW_NAME,
+                        "parameters": active_inputs,
+                        "latency_ms": round((time.perf_counter() - t_start) * 1000.0, 2),
+                        "steps": [],
+                        "compile_hash": self.COMPILE_HASH,
+                    })
+
+                if response is None or response.status < 200 or response.status >= 400:
+                    resp_status = response.status if response else "no response"
+                    return _redact_workflow_results({
+                        "status": "error",
+                        "success": False,
+                        "error": f"Navigation to '{target_nav_url}' returned HTTP {resp_status}",
+                        "workflow": self.WORKFLOW_NAME,
+                        "parameters": active_inputs,
+                        "latency_ms": round((time.perf_counter() - t_start) * 1000.0, 2),
+                        "steps": [],
+                        "compile_hash": self.COMPILE_HASH,
+                    })
 
                 # Dynamically replay action nodes parsed from state_graph.json
+                overall_success = True
+                unverified_error = None
                 for step in self.ACTION_STEPS:
                     action = step.get("action", "click")
                     target = step.get("target_anchor")
@@ -484,6 +537,7 @@ class {{ workflow_class_name }}:
                     norm_y = step.get("norm_y", 0.5)
                     param_ref = step.get("parameter_ref")
                     step_timeout = step.get("timeout_ms")
+                    best_effort = step.get("best_effort", False)
 
                     if action in ("fill", "type", "input"):
                         val = parameters.get(param_ref, step.get("default_value", "")) if param_ref else step.get("default_value", "")
@@ -493,11 +547,28 @@ class {{ workflow_class_name }}:
                         step_res = await self.click_target(page, target, norm_x=norm_x, norm_y=norm_y, timeout_ms=step_timeout)
                         steps_executed.append(step_res)
 
+                    if not step_res.get("verified", False) and not best_effort:
+                        overall_success = False
+                        unverified_error = f"Step '{target}' postcondition verification failed"
+                        break
+
                 if not self.headless:
                     await page.wait_for_timeout(2000)
 
                 await browser.close()
                 latency_ms = round((time.perf_counter() - t_start) * 1000.0, 2)
+
+                if not overall_success:
+                    return _redact_workflow_results({
+                        "status": "error",
+                        "success": False,
+                        "error": unverified_error or "Workflow step postcondition verification failed",
+                        "workflow": self.WORKFLOW_NAME,
+                        "parameters": active_inputs,
+                        "latency_ms": latency_ms,
+                        "steps": steps_executed,
+                        "compile_hash": self.COMPILE_HASH,
+                    })
 
                 return _redact_workflow_results({
                     "status": "success",
@@ -509,49 +580,13 @@ class {{ workflow_class_name }}:
                     "compile_hash": self.COMPILE_HASH,
                 })
         except Exception as e:
-            if self.live:
-                return _redact_workflow_results({
-                    "status": "error",
-                    "success": False,
-                    "error": f"Live execution failed: {e}",
-                    "workflow": self.WORKFLOW_NAME,
-                    "parameters": active_inputs,
-                    "latency_ms": round((time.perf_counter() - t_start) * 1000.0, 2),
-                    "steps": steps_executed,
-                    "compile_hash": self.COMPILE_HASH,
-                })
-            if not self.headless:
-                raise e
-            # Resilient fallback: Return simulated deterministic execution if browser is headless/unserved
-            logger.debug(f"Live browser bypassed ({e}), returning compile-time translated coordinates")
-            for step in self.ACTION_STEPS:
-                action = step.get("action", "click")
-                target = step.get("target_anchor")
-                norm_x = step.get("norm_x", 0.5)
-                norm_y = step.get("norm_y", 0.5)
-                param_ref = step.get("parameter_ref")
-                px = round(norm_x * self.viewport_width, 2)
-                py = round(norm_y * self.viewport_height, 2)
-                val = parameters.get(param_ref, step.get("default_value", "")) if param_ref else None
-
-                emitted_step_val = "[REDACTED]" if (_is_sensitive_identifier(target) or _is_sensitive_identifier(param_ref)) else str(val)
-                steps_executed.append({
-                    "anchor": target,
-                    "action": action,
-                    "parameter_ref": param_ref,
-                    "value": emitted_step_val if action in ("fill", "type") else None,
-                    "pixel_coordinates": {"x": px, "y": py},
-                    "strategy": "sam_visual_coordinates",
-                    "success": True,
-                })
-
-            latency_ms = round((time.perf_counter() - t_start) * 1000.0 + 10.0, 2)
             return _redact_workflow_results({
-                "status": "success",
-                "success": True,
+                "status": "error",
+                "success": False,
+                "error": f"Execution failed: {e}",
                 "workflow": self.WORKFLOW_NAME,
                 "parameters": active_inputs,
-                "latency_ms": latency_ms,
+                "latency_ms": round((time.perf_counter() - t_start) * 1000.0, 2),
                 "steps": steps_executed,
                 "compile_hash": self.COMPILE_HASH,
             })

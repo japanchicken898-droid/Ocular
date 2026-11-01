@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional, Union
+from urllib.parse import urlparse
 import urllib.request
 import networkx as nx
 from rich.tree import Tree
@@ -166,15 +167,39 @@ class DAGBuilder(BaseSynthesizer):
         transitions: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Calls the live Baseten Meta Muse Spark endpoint using the standard OpenAI client."""
-        baseten_key = os.getenv("BASETEN_API_KEY")
-        if not baseten_key:
+        # External inference must be explicitly authorized
+        if os.environ.get("OCULAR_ALLOW_EXTERNAL_INFERENCE") != "1":
+            logger.info("External inference not authorized via OCULAR_ALLOW_EXTERNAL_INFERENCE=1; using local synthesis.")
             return None
-        api_key = baseten_key
+
+        base_url = os.getenv("MUSE_SPARK_API_ENDPOINT", "https://inference.baseten.co/v1")
+        parsed = urlparse(base_url)
+        if parsed.scheme.lower() != "https":
+            logger.warning(f"Insecure plaintext endpoint rejected for MUSE_SPARK_API_ENDPOINT: {base_url}")
+            return None
+
+        # Credential isolation: only use BASETEN_API_KEY for baseten, META_MODEL_API_KEY for meta
+        hostname = (parsed.hostname or "").lower()
+        if "baseten" in hostname:
+            api_key = os.getenv("BASETEN_API_KEY")
+        elif "meta" in hostname:
+            api_key = os.getenv("META_MODEL_API_KEY")
+        else:
+            api_key = os.getenv("BASETEN_API_KEY") or os.getenv("META_MODEL_API_KEY")
+
+        if not api_key:
+            return None
 
         if OpenAI is None:
             return None
 
-        base_url = os.getenv("MUSE_SPARK_API_ENDPOINT", "https://inference.baseten.co/v1")
+        allowed_api_hosts_env = os.environ.get("OCULAR_ALLOWED_API_HOSTS", "")
+        if allowed_api_hosts_env:
+            allowed_api_hosts = {h.strip().lower() for h in allowed_api_hosts_env.split(",") if h.strip()}
+            if parsed.hostname and parsed.hostname.lower() not in allowed_api_hosts:
+                logger.warning(f"MUSE_SPARK_API_ENDPOINT host '{parsed.hostname}' not in OCULAR_ALLOWED_API_HOSTS")
+                return None
+
         model_id = os.getenv("MUSE_SPARK_MODEL_ID", "meta-models/muse-spark-open-1026")
 
         try:
@@ -322,6 +347,14 @@ class DAGBuilder(BaseSynthesizer):
                         e["to_node"] = e["to"]
                     if "target" in e and "to_node" not in e:
                         e["to_node"] = e["target"]
+                    if "from_node_id" not in e and "from_node" in e:
+                        e["from_node_id"] = e["from_node"]
+                    if "to_node_id" not in e and "to_node" in e:
+                        e["to_node_id"] = e["to_node"]
+                    if "from_node" not in e and "from_node_id" in e:
+                        e["from_node"] = e["from_node_id"]
+                    if "to_node" not in e and "to_node_id" in e:
+                        e["to_node"] = e["to_node_id"]
                     if "action" in e and "action_type" not in e:
                         e["action_type"] = e["action"]
                     if "target_id" in e and "trigger_element" not in e:
@@ -362,6 +395,22 @@ class DAGBuilder(BaseSynthesizer):
                         ndata["method"] = "GET" if "root" in nid else "POST"
                     if "segment_ids" not in ndata:
                         ndata["segment_ids"] = [s.get("id") for s in segments if isinstance(s, dict) and "id" in s]
+
+                # Strict validation of LLM DAG outputs against DAGNode, DAGEdge, and Phase 0 constraints
+                for nid, ndata in data["nodes"].items():
+                    try:
+                        DAGNode.model_validate(ndata)
+                    except Exception as ve:
+                        raise CompilationError(f"LLM DAG node '{nid}' failed schema validation: {ve}")
+
+                for edge in data["edges"]:
+                    try:
+                        DAGEdge.model_validate(edge)
+                    except Exception as ve:
+                        raise CompilationError(f"LLM DAG edge failed schema validation: {ve}")
+                    timeout = edge.get("timeout_ms", 5000)
+                    if not isinstance(timeout, int) or timeout <= 0 or timeout > 120000:
+                        raise CompilationError(f"Invalid timeout_ms in LLM DAG edge: {timeout}")
 
                 # Ensure canonical TradingView states if applicable
                 if "TradingView" in self.workflow_name and "state_interval_selected" not in data["nodes"]:
@@ -445,6 +494,8 @@ class DAGBuilder(BaseSynthesizer):
                 return dag_result
 
         except Exception as exc:
+            if isinstance(exc, CompilationError):
+                raise exc
             logger.debug(f"Muse Spark API request handled via fallback ({exc}); seamlessly using local synthesis.")
 
         return None
@@ -456,11 +507,6 @@ class DAGBuilder(BaseSynthesizer):
         telemetry_events: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Synthesizes segments and actions into a validated Directed Acyclic Graph (DAG)."""
-        # 1. Try official Meta Model API if configured
-        api_dag = self._call_muse_spark_api(segments, transitions)
-        if api_dag is not None:
-            return api_dag
-
         seg_by_id = {s["id"]: s for s in segments if isinstance(s, dict) and "id" in s}
 
         # Synthesize transitions from telemetry clicks if transitions is empty
@@ -490,6 +536,11 @@ class DAGBuilder(BaseSynthesizer):
                 "Ingested recording contains zero actionable elements. "
                 "No interactive segments, transitions, or telemetry events found."
             )
+
+        # 1. Try official Meta Model API if configured
+        api_dag = self._call_muse_spark_api(segments, transitions)
+        if api_dag is not None:
+            return api_dag
 
         # If dynamic transitions are provided with multiple frames
         if transitions and len(transitions) > 0:
@@ -925,13 +976,21 @@ class DAGBuilder(BaseSynthesizer):
                     action_enum = a
                     break
 
+            raw_trigger = e.get("trigger_element") or e.get("target_segment_id") or ""
+            clean_trigger = re.sub(r"[^A-Za-z0-9_-]+", "_", str(raw_trigger).lstrip("#")).strip("_")[:64]
+            if clean_trigger and clean_trigger[0].isdigit():
+                clean_trigger = f"anchor_{clean_trigger}"[:64]
+            target_seg_id = clean_trigger if clean_trigger else None
+
+            raw_selector = e.get("target_selector") or (f"#{raw_trigger}" if raw_trigger else "")
+
             typed_edges.append(
                 DAGEdge(
                     from_node_id=e["from_node"],
                     to_node_id=e["to_node"],
                     action_type=action_enum,
-                    target_segment_id=e.get("trigger_element"),
-                    target_selector=e.get("target_selector", f"#{e.get('trigger_element')}"),
+                    target_segment_id=target_seg_id,
+                    target_selector=raw_selector,
                     target_label=e.get("target_label"),
                     parameter_ref=e.get("parameter_ref"),
                     timeout_ms=e.get("timeout_ms", 5000),
@@ -1016,19 +1075,21 @@ def generate_mermaid_dag(dag: Dict[str, Any]) -> str:
 
 
 def export_mermaid_dag(dag: Dict[str, Any], output_path: Union[str, Path]) -> Path:
-    """Exports the synthesized workflow DAG as a Mermaid diagram file."""
+    """Exports the synthesized workflow DAG as a Mermaid diagram file, refusing symlinks."""
     out_file = Path(output_path)
     out_file.parent.mkdir(parents=True, exist_ok=True)
-    if out_file.is_symlink():
-        out_file.unlink()
+    if out_file.is_symlink() or os.path.islink(out_file):
+        raise IOError(f"Refusing to write to symlink at {out_file}")
     mermaid_content = generate_mermaid_dag(dag)
     out_file.write_text(mermaid_content, encoding="utf-8")
     return out_file
 
 
 def render_rich_dag_tree(dag: Dict[str, Any]) -> Tree:
-    """Constructs a Rich Tree visualizing states, preconditions, and action transitions."""
-    workflow_name = dag.get("workflow_name", "OcularWorkflow")
+    """Constructs a Rich Tree visualizing states, preconditions, and action transitions with markup escaping."""
+    import rich.markup
+
+    workflow_name = rich.markup.escape(str(dag.get("workflow_name", "OcularWorkflow")))
     nodes = dag.get("nodes", {})
     edges = dag.get("edges", [])
     topo_order = dag.get("topological_order", list(nodes.keys()))
@@ -1044,23 +1105,26 @@ def render_rich_dag_tree(dag: Dict[str, Any]) -> Tree:
 
     for nid in topo_order:
         ndata = nodes.get(nid, {})
-        label = ndata.get("label", nid)
+        label = rich.markup.escape(str(ndata.get("label", nid)))
+        nid_escaped = rich.markup.escape(str(nid))
         is_root = (nid == dag.get("root_node"))
         is_term = (nid == dag.get("terminal_node"))
 
         badge = "[bold green][ROOT][/bold green] " if is_root else ("[bold magenta][TERMINAL][/bold magenta] " if is_term else "")
-        node_branch = root_tree.add(f"{badge}[bold white]{nid}[/bold white] - [dim]{label}[/dim]")
+        node_branch = root_tree.add(f"{badge}[bold white]{nid_escaped}[/bold white] - [dim]{label}[/dim]")
 
         for p in ndata.get("preconditions", []):
-            node_branch.add(f"[cyan]⚡ Precondition:[/cyan] {p.get('description', p.get('type'))}")
+            desc = rich.markup.escape(str(p.get('description', p.get('type', ''))))
+            node_branch.add(f"[cyan]⚡ Precondition:[/cyan] {desc}")
 
         for inv in ndata.get("assertions", []):
-            node_branch.add(f"[green]✓ Invariant:[/green] {inv}")
+            inv_escaped = rich.markup.escape(str(inv))
+            node_branch.add(f"[green]✓ Invariant:[/green] {inv_escaped}")
 
         for e in edges_by_from.get(nid, []):
-            action = e.get("action_type", "action")
-            target = e.get("trigger_element", e.get("target_label", "target"))
-            to_n = e.get("to_node", "")
+            action = rich.markup.escape(str(e.get("action_type", "action")))
+            target = rich.markup.escape(str(e.get("trigger_element", e.get("target_label", "target"))))
+            to_n = rich.markup.escape(str(e.get("to_node", "")))
             node_branch.add(f"[yellow]──({action}: {target})──>[/yellow] [bold white]{to_n}[/bold white]")
 
     return root_tree

@@ -18,7 +18,7 @@ import re
 import socket
 import unicodedata
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
-from urllib.parse import urlparse, urlsplit, urlunsplit
+from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit
 
 logger = logging.getLogger("ocular.security.netguard")
 
@@ -66,6 +66,9 @@ BLOCKED_NAME_SUFFIXES = (
     ".onion",
     ".invalid",
     ".test",
+    ".nip.io",
+    ".sslip.io",
+    ".localtest.me",
 )
 
 # Per-process / per-run DNS verdict cache: maps hostname -> is_blocked boolean
@@ -73,8 +76,9 @@ _DNS_CACHE: Dict[str, bool] = {}
 
 
 def get_allowed_hosts() -> Set[str]:
-    """Retrieves allowed hosts set from OCULAR_ALLOWED_HOSTS environment variable."""
-    raw = os.environ.get("OCULAR_ALLOWED_HOSTS", "").strip()
+    """Retrieves allowed hosts set from OCULAR_ALLOWED_HOSTS or OCULAR_ALLOWED_EGRESS_HOSTS."""
+    raw = os.environ.get("OCULAR_ALLOWED_HOSTS") or os.environ.get("OCULAR_ALLOWED_EGRESS_HOSTS", "")
+    raw = raw.strip()
     if not raw:
         return set()
     return {h.strip().lower() for h in re.split(r"[\s,;]+", raw) if h.strip()}
@@ -415,7 +419,24 @@ async def setup_confinement_routes(
                 await route.abort("blockedbyclient")
                 return
 
-            await route.continue_()
+            resp = await route.fetch(max_redirects=0)
+            if resp.status in (301, 302, 303, 307, 308):
+                loc = resp.headers.get("location")
+                if loc:
+                    target_url = urljoin(req_url, loc)
+                    target_parsed = urlparse(target_url)
+                    t_host = target_parsed.hostname or ""
+                    t_port = target_parsed.port
+                    if blocked_port and t_port == blocked_port:
+                        logger.warning(f"Aborting redirect to blocked port {t_port}: {target_url}")
+                        await route.abort("blockedbyclient")
+                        return
+                    if await resolve_and_check_host(t_host, port=t_port, allowed_hosts=active_allowlist):
+                        logger.warning(f"Aborting redirect to prohibited host: {t_host}")
+                        await route.abort("blockedbyclient")
+                        return
+
+            await route.fulfill(response=resp)
         except Exception as exc:
             logger.debug(f"Error in _http_route_guard: {exc}; aborting route.")
             await route.abort("blockedbyclient")
