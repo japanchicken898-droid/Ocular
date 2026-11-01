@@ -438,9 +438,8 @@ class {{ workflow_class_name }}:
                     viewport={"width": self.viewport_width, "height": self.viewport_height},
                     color_scheme="dark",
                 )
-                page: Page = await context.new_page()
 
-                # Browser-level redirect guard: block navigations to private/loopback subnets (SSRF defense)
+                # Browser-level SSRF redirect guard: intercept all context requests (popups, windows, iframes, redirects)
                 async def _ssrf_route_guard(route):
                     req_url = route.request.url
                     if _is_private_url(req_url):
@@ -449,7 +448,8 @@ class {{ workflow_class_name }}:
                     else:
                         await route.continue_()
 
-                await page.route("**/*", _ssrf_route_guard)
+                await context.route("**/*", _ssrf_route_guard)
+                page: Page = await context.new_page()
 
                 target_nav_url = (self.base_url or self.TARGET_URL).rstrip("/")
 

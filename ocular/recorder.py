@@ -83,8 +83,16 @@ class OcularSessionRecorder:
             if (tag === 'input' && inputType === 'password') {
                 return true;
             }
-            const sensitiveRegex = /password|token|secret|credit_card|cvv/i;
-            const attrs = ['name', 'id', 'autocomplete', 'placeholder', 'aria-label', 'data-role'];
+            const isContentEditable = Boolean(el.isContentEditable || (el.getAttribute && (el.getAttribute('contenteditable') === 'true' || el.getAttribute('contenteditable') === '')));
+            const isTextarea = tag === 'textarea';
+            const sensitiveRegex = /password|token|secret|credit_card|credit-card|cvv|one-time-code|one_time_code|otp|pin|ssn|auth_key|auth-key/i;
+
+            if (isTextarea || isContentEditable) {
+                if (sensitiveRegex.test(el.id || '') || sensitiveRegex.test(el.className || '') || sensitiveRegex.test(el.getAttribute ? el.getAttribute('placeholder') || '' : '')) {
+                    return true;
+                }
+            }
+            const attrs = ['name', 'id', 'autocomplete', 'placeholder', 'aria-label', 'data-role', 'type', 'aria-description'];
             for (let i = 0; i < attrs.length; i++) {
                 const val = el.getAttribute ? el.getAttribute(attrs[i]) : null;
                 if (val && sensitiveRegex.test(val)) {
@@ -153,7 +161,7 @@ class OcularSessionRecorder:
         self.video_path: Optional[Path] = None
 
     SENSITIVE_ATTR_PATTERN = re.compile(
-        r"password|token|secret|credit_card|cvv|api_key|auth", re.IGNORECASE
+        r"password|token|secret|credit_card|credit-card|cvv|one-time-code|one_time_code|otp|pin|ssn|auth_key|auth-key|api_key|auth", re.IGNORECASE
     )
 
     def _truncate_attributes(self, event_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -179,6 +187,10 @@ class OcularSessionRecorder:
 
     def push_telemetry_event(self, event_data: Dict[str, Any]) -> None:
         """Appends an event to in-memory history and streams to telemetry_events.jsonl."""
+        if not isinstance(event_data, dict):
+            logger.warning(f"Ignoring non-dictionary telemetry event: {type(event_data)}")
+            return
+
         if len(self.telemetry_events) >= self.MAX_TELEMETRY_EVENTS:
             logger.warning(
                 f"Telemetry event limit reached ({self.MAX_TELEMETRY_EVENTS}). Dropping event."
@@ -296,7 +308,7 @@ class OcularSessionRecorder:
 
     @staticmethod
     def load_telemetry_events(path: Union[str, Path]) -> List[Dict[str, Any]]:
-        """Parses telemetry_events.jsonl into a list of event dictionaries."""
+        """Parses telemetry_events.jsonl into a list of event dictionaries, safely rejecting non-dict payloads."""
         file_path = Path(path)
         if not file_path.exists():
             return []
@@ -306,7 +318,11 @@ class OcularSessionRecorder:
                 line = line.strip()
                 if line:
                     try:
-                        events.append(json.loads(line))
-                    except json.JSONDecodeError:
+                        data = json.loads(line)
+                        if isinstance(data, dict):
+                            events.append(data)
+                        else:
+                            logger.debug(f"Ignoring non-dictionary telemetry payload: {type(data)}")
+                    except (json.JSONDecodeError, ValueError):
                         continue
         return events

@@ -166,7 +166,7 @@ class VideoIngestSampler:
             [
                 e
                 for e in telemetry_events
-                if e.get("event_type") == "mousedown" or e.get("action_type") == "click"
+                if isinstance(e, dict) and (e.get("event_type") == "mousedown" or e.get("action_type") == "click")
             ]
             if telemetry_events
             else []
@@ -361,7 +361,7 @@ class VideoIngestSampler:
             [
                 e
                 for e in telemetry_events
-                if e.get("event_type") == "mousedown" or e.get("action_type") == "click"
+                if isinstance(e, dict) and (e.get("event_type") == "mousedown" or e.get("action_type") == "click")
             ]
             if telemetry_events
             else []

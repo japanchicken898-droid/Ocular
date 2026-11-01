@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import keyword
 import logging
 from pathlib import Path
 import re
@@ -18,7 +19,7 @@ logger = logging.getLogger("ocular.pipeline.code_generator")
 
 
 SECRET_PATTERN = re.compile(
-    r"password|token|secret|credit_card|cvv|api_key|auth|bearer", re.IGNORECASE
+    r"password|token|secret|credit_card|cvv|one-time-code|otp|pin|ssn|auth_key|api_key|auth|bearer", re.IGNORECASE
 )
 
 
@@ -26,13 +27,15 @@ def _sanitize_param_key(name: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", str(name).strip())
     if not cleaned or cleaned[0].isdigit():
         cleaned = f"param_{cleaned}"
+    if keyword.iskeyword(cleaned):
+        cleaned = f"{cleaned}_"
     return cleaned
 
 
 def sanitize_workflow_class_name(name: Optional[str]) -> str:
     """Sanitizes a string to be a valid Python identifier for workflow class names.
 
-    Guarantees an alphabetic prefix and strips invalid characters.
+    Guarantees an alphabetic prefix, strips invalid characters, and avoids reserved keywords.
     """
     if not name:
         return "OcularWorkflow"
@@ -46,8 +49,14 @@ def sanitize_workflow_class_name(name: Optional[str]) -> str:
     if not cleaned[0].isalpha():
         cleaned = f"Workflow_{cleaned}"
 
+    if keyword.iskeyword(cleaned):
+        cleaned = f"{cleaned}_"
+
     if not cleaned.endswith("Workflow"):
         cleaned = f"{cleaned}Workflow"
+
+    if keyword.iskeyword(cleaned):
+        cleaned = f"{cleaned}_"
 
     return cleaned
 
@@ -114,6 +123,8 @@ def extract_telemetry_input_parameters(telemetry_events: Optional[List[Dict[str,
 
     by_target: Dict[str, List[Dict[str, Any]]] = {}
     for ev in telemetry_events:
+        if not isinstance(ev, dict):
+            continue
         ev_type = str(ev.get("event_type", "")).lower()
         action = str(ev.get("action_type", "")).lower()
         if ev_type in ("keydown", "input", "keypress") or action in ("fill", "type"):
@@ -177,6 +188,8 @@ def extract_origin_url(
     # 2. Check telemetry events (first event or any event)
     if telemetry_events:
         for ev in telemetry_events:
+            if not isinstance(ev, dict):
+                continue
             for k in ("url", "page_url", "origin", "target_url"):
                 val = ev.get(k)
                 if val and isinstance(val, str) and ("http://" in val or "https://" in val):
@@ -479,22 +492,22 @@ class JinjaCodeGenerator(BaseGenerator):
             }
 
         for inp in input_fields:
-            inp["key_repr"] = json.dumps(str(inp.get("key", "")))
-            inp["target_anchor_repr"] = json.dumps(str(inp.get("target_anchor", "")))
-            inp["default_value_repr"] = json.dumps(str(inp.get("default_value", "")))
-            inp["label_repr"] = json.dumps(str(inp.get("label", "")))
-            inp["action_repr"] = json.dumps(str(inp.get("action", "")))
+            inp["key_repr"] = json.dumps(str(inp.get("key") or ""))
+            inp["target_anchor_repr"] = json.dumps(str(inp.get("target_anchor") or ""))
+            inp["default_value_repr"] = json.dumps(str(inp.get("default_value") if inp.get("default_value") is not None else ""))
+            inp["label_repr"] = json.dumps(str(inp.get("label") or ""))
+            inp["action_repr"] = json.dumps(str(inp.get("action") or "fill"))
             inp["selector_repr"] = json.dumps(str(inp.get("selector") or ""))
-            inp["parameter_ref_repr"] = json.dumps(str(inp.get("parameter_ref", "")))
+            inp["parameter_ref_repr"] = json.dumps(str(inp.get("parameter_ref") or ""))
 
         for step in action_steps:
-            step["action_repr"] = json.dumps(str(step.get("action", "")))
-            step["target_anchor_repr"] = json.dumps(str(step.get("target_anchor", "")))
+            step["action_repr"] = json.dumps(str(step.get("action") or "click"))
+            step["target_anchor_repr"] = json.dumps(str(step.get("target_anchor") or ""))
             step["selector_repr"] = json.dumps(str(step.get("selector"))) if step.get("selector") is not None else "None"
             step["label_repr"] = json.dumps(str(step.get("label"))) if step.get("label") is not None else "None"
             step["parameter_ref_repr"] = json.dumps(str(step.get("parameter_ref"))) if step.get("parameter_ref") is not None else "None"
-            step["default_value_repr"] = json.dumps(str(step.get("default_value", "")))
-            step["description_repr"] = json.dumps(str(step.get("description", "")))
+            step["default_value_repr"] = json.dumps(str(step.get("default_value") if step.get("default_value") is not None else ""))
+            step["description_repr"] = json.dumps(str(step.get("description") or ""))
 
         context = {
             "dag": dag,

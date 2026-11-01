@@ -1,5 +1,6 @@
 """Security audit hardening unit and integration tests."""
 
+import json
 import os
 from pathlib import Path
 import pytest
@@ -558,6 +559,122 @@ def test_browser_redirect_guard_blocks_private_ip(tmp_path: Path):
         sys.modules.pop("playwright_driver", None)
         if str(out_dir.resolve()) in sys.path:
             sys.path.remove(str(out_dir.resolve()))
+
+
+def test_keyword_sanitization_in_workflow_name():
+    """Verify that Python reserved keywords are escaped in workflow class and parameter names."""
+    import keyword
+
+    # Reserved keywords must be sanitized
+    kw_name = sanitize_workflow_class_name("class")
+    assert kw_name.isidentifier()
+    assert not keyword.iskeyword(kw_name)
+    assert kw_name == "class_Workflow"
+
+    def_name = sanitize_workflow_class_name("def")
+    assert def_name.isidentifier()
+    assert not keyword.iskeyword(def_name)
+
+    from ocular.pipeline.code_generator import _sanitize_param_key
+    param_kw = _sanitize_param_key("for")
+    assert param_kw.isidentifier()
+    assert not keyword.iskeyword(param_kw)
+    assert param_kw == "for_"
+
+
+def test_context_level_ssrf_route_interception(tmp_path: Path):
+    """Verify that route interception is attached at the BrowserContext level."""
+    generator = JinjaCodeGenerator()
+    out_dir = tmp_path / "context_ssrf_dist"
+    artifacts = generator.emit(dag={"workflow_name": "ContextSSRFWorkflow"}, segments=[], out_dir=out_dir)
+
+    driver_code = artifacts["playwright_driver"].read_text(encoding="utf-8")
+    assert "await context.route(" in driver_code
+    assert "_ssrf_route_guard" in driver_code
+
+
+def test_recorder_sensitive_field_expansion(tmp_path: Path):
+    """Verify that isSensitiveElement expands to contenteditable, textarea, and extended sensitive tokens."""
+    recorder = OcularSessionRecorder(out_dir=tmp_path)
+    script = recorder.TELEMETRY_INIT_SCRIPT
+    assert "contenteditable" in script
+    assert "textarea" in script
+    for token in ("otp", "pin", "ssn", "one-time-code", "auth_key", "credit_card", "cvv", "password", "token", "secret"):
+        assert token in script
+
+    # Test server-side truncation and redaction with extended patterns
+    event = {
+        "event_type": "keydown",
+        "action_type": "fill",
+        "target_selector": "input#user_one_time_code",
+        "key": "123456",
+        "input_payload": "123456",
+    }
+    recorder.push_telemetry_event(event)
+    stored = recorder.telemetry_events[-1]
+    assert stored["key"] == "[REDACTED]"
+    assert stored["input_payload"] == "[REDACTED]"
+
+
+def test_robust_telemetry_deserialization_rejects_non_dict(tmp_path: Path):
+    """Verify that load_telemetry_events safely rejects non-dict JSON entries (lists, strings, nulls, numbers)."""
+    telem_file = tmp_path / "telemetry_events.jsonl"
+    lines = [
+        json.dumps({"event_type": "mousedown", "action_type": "click", "norm_x": 0.5, "norm_y": 0.5}),
+        json.dumps(["invalid", "list"]),
+        json.dumps("just a string"),
+        json.dumps(12345),
+        json.dumps(None),
+        "not valid json at all",
+        json.dumps({"event_type": "keydown", "action_type": "fill", "key": "a"}),
+    ]
+    telem_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    events = OcularSessionRecorder.load_telemetry_events(telem_file)
+    assert len(events) == 2
+    assert all(isinstance(e, dict) for e in events)
+
+    # Verify push_telemetry_event rejects non-dict inputs
+    recorder = OcularSessionRecorder(out_dir=tmp_path)
+    recorder.push_telemetry_event(["invalid", "payload"])
+    recorder.push_telemetry_event("raw string")
+    recorder.push_telemetry_event(None)
+    assert len(recorder.telemetry_events) == 0
+
+    # Verify video_ingest processes corrupted telemetry without throwing AttributeError
+    from ocular.pipeline.video_ingest import VideoIngestSampler
+    import numpy as np
+
+    sampler = VideoIngestSampler(sample_rate=2.0)
+    corrupted_telemetry = [{"valid": 1}, ["bad"], "string", 42, None]
+    frames = [np.zeros((100, 100, 3), dtype=np.uint8) for _ in range(3)]
+    f_meta, trans, _ = sampler.process_frames_list(frames, telemetry_events=corrupted_telemetry)
+    assert len(f_meta) == 3
+
+
+def test_fail_explicit_ingestion_zero_actionable_elements():
+    """Verify that build_dag raises CompilationError on zero actionable elements rather than falling back to TradingView."""
+    from ocular.pipeline.state_graph import DAGBuilder, CompilationError
+
+    builder = DAGBuilder(workflow_name="EmptyWorkflow")
+
+    with pytest.raises(CompilationError) as exc_info:
+        builder.build_dag(segments=[], transitions=[], telemetry_events=[])
+    assert "zero actionable elements" in str(exc_info.value).lower()
+
+    # Generic segments must synthesize a custom DAG rather than hardcoded TradingView states
+    custom_segments = [
+        {"id": "custom_login_btn", "label": "Login", "role": "button", "bbox": {"x": 0.1, "y": 0.1, "width": 0.2, "height": 0.05}},
+        {"id": "custom_search_bar", "label": "Search", "role": "input", "bbox": {"x": 0.1, "y": 0.2, "width": 0.4, "height": 0.05}},
+    ]
+    custom_dag = builder.build_dag(segments=custom_segments)
+    assert "state_root" in custom_dag["nodes"]
+    # Must NOT contain hardcoded TradingView interval dropdown states
+    assert "state_interval_menu_open" not in custom_dag["nodes"]
+    assert "state_interval_selected" not in custom_dag["nodes"]
+    # Must contain custom segment states
+    assert any("custom_login_btn" in nid for nid in custom_dag["nodes"])
+
 
 
 

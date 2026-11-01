@@ -48,6 +48,11 @@ from ocular.pipeline.base import BaseSynthesizer
 logger = logging.getLogger("ocular.pipeline.state_graph")
 
 
+class CompilationError(Exception):
+    """Raised when an ingested recording cannot be compiled (e.g. zero actionable elements)."""
+    pass
+
+
 class DAGBuilder(BaseSynthesizer):
     """Synthesizes visual segments and transition diffs into a verified DAG."""
 
@@ -440,7 +445,7 @@ class DAGBuilder(BaseSynthesizer):
         if api_dag is not None:
             return api_dag
 
-        seg_by_id = {s["id"]: s for s in segments}
+        seg_by_id = {s["id"]: s for s in segments if isinstance(s, dict) and "id" in s}
 
         # Synthesize transitions from telemetry clicks if transitions is empty
         if not transitions and telemetry_events:
@@ -448,7 +453,7 @@ class DAGBuilder(BaseSynthesizer):
             clicks = [
                 e
                 for e in telemetry_events
-                if e.get("event_type") == "mousedown" or e.get("action_type") == "click"
+                if isinstance(e, dict) and (e.get("event_type") == "mousedown" or e.get("action_type") == "click")
             ]
             for c_idx, c in enumerate(clicks):
                 transitions.append(
@@ -462,6 +467,13 @@ class DAGBuilder(BaseSynthesizer):
                         "telemetry_event": c,
                     }
                 )
+
+        # Fail-explicit: reject recordings with zero actionable elements
+        if not seg_by_id and not transitions:
+            raise CompilationError(
+                "Ingested recording contains zero actionable elements. "
+                "No interactive segments, transitions, or telemetry events found."
+            )
 
         # If dynamic transitions are provided with multiple frames
         if transitions and len(transitions) > 0:
@@ -619,8 +631,8 @@ class DAGBuilder(BaseSynthesizer):
                     "route": "/api/v1/chart/interval",
                     "method": "POST",
                 }
-        else:
-            # Canonical structured workflow mapping
+        elif "interval_dropdown" in seg_by_id and "timeframe_15m" in seg_by_id:
+            # Canonical structured workflow mapping when TradingView elements are specifically present
             nodes = {
                 "state_root": {
                     "id": "state_root",
@@ -722,6 +734,81 @@ class DAGBuilder(BaseSynthesizer):
                     "description": "Select 15m timeframe",
                 },
             ]
+        elif seg_by_id:
+            # Dynamically synthesize state nodes and transitions from detected interactive segments
+            # (zero silent fallback to TradingView)
+            first_id = list(seg_by_id.keys())[0]
+            nodes = {
+                "state_root": {
+                    "id": "state_root",
+                    "label": "Initial Screen State",
+                    "title": "Initial Screen State",
+                    "screen_name": "screen_root",
+                    "screen_hash": self._hash_screen("Root Screen", list(seg_by_id.keys())),
+                    "url_pattern": "/",
+                    "preconditions": [
+                        {
+                            "type": "element_present",
+                            "target_id": first_id,
+                            "description": f"Verify initial element '{first_id}' rendered",
+                        }
+                    ],
+                    "assertions": ["assert page.is_visible()"],
+                    "route": "/api/v1/status",
+                    "method": "GET",
+                    "segment_ids": list(seg_by_id.keys()),
+                }
+            }
+            edges = []
+            prev_node = "state_root"
+            for idx, (sid, seg) in enumerate(seg_by_id.items()):
+                role = str(seg.get("role", "button")).lower()
+                action = "fill" if role in ("input", "textbox") else "click"
+                node_id = f"state_{idx}_{sid}"
+                nodes[node_id] = {
+                    "id": node_id,
+                    "label": f"State after {action} {sid}",
+                    "title": f"State {sid}",
+                    "screen_name": f"screen_{sid}",
+                    "screen_hash": self._hash_screen(f"Screen {sid}", [sid]),
+                    "url_pattern": f"/step/{idx + 1}",
+                    "preconditions": [
+                        {
+                            "type": "state_active",
+                            "target_id": prev_node,
+                            "description": f"Preceding state '{prev_node}' must be active",
+                        }
+                    ],
+                    "action": {
+                        "type": action,
+                        "target_id": sid,
+                        "target_segment": seg,
+                    },
+                    "assertions": [f"assert {sid}.is_visible()"],
+                    "route": f"/api/v1/step/{idx + 1}",
+                    "method": "POST",
+                    "segment_ids": [sid],
+                }
+                edges.append(
+                    {
+                        "from_node": prev_node,
+                        "to_node": node_id,
+                        "transition_label": f"execute_{action}_{sid}",
+                        "trigger_element": sid,
+                        "action_type": action,
+                        "target_selector": seg.get("suggested_selector") or f"#{sid}",
+                        "target_label": seg.get("label", sid),
+                        "timeout_ms": 5000,
+                        "wait_condition": "domcontentloaded",
+                        "description": f"Execute {action} on {sid}",
+                    }
+                )
+                prev_node = node_id
+        else:
+            raise CompilationError(
+                "Ingested recording contains zero actionable elements. "
+                "No interactive segments, transitions, or telemetry events found."
+            )
 
         # Verify DAG properties using NetworkX
         g = nx.DiGraph()

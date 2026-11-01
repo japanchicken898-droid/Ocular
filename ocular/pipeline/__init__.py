@@ -3,7 +3,7 @@
 from ocular.pipeline.base import BaseSegmenter, BaseSynthesizer, BaseGenerator
 from ocular.pipeline.video_ingest import VideoIngestSampler
 from ocular.pipeline.segmenter import MockSAMSegmenter
-from ocular.pipeline.state_graph import DAGBuilder
+from ocular.pipeline.state_graph import DAGBuilder, CompilationError
 from ocular.pipeline.code_generator import JinjaCodeGenerator
 
 __all__ = [
@@ -13,5 +13,6 @@ __all__ = [
     "VideoIngestSampler",
     "MockSAMSegmenter",
     "DAGBuilder",
+    "CompilationError",
     "JinjaCodeGenerator",
 ]
