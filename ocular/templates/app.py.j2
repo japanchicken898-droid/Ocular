@@ -246,11 +246,11 @@ try:
 except ImportError:
     try:
         from ocular.security.redaction import is_sensitive_field, scrub_exception
-    except ImportError:
-        def is_sensitive_field(val: Any) -> bool:
-            return False
-        def scrub_exception(exc: Any, secrets: Any = None) -> str:
-            return str(exc)
+    except ImportError as exc:
+        raise RuntimeError(
+            "FATAL: redaction module unavailable — refusing to start without secret "
+            "redaction. This indicates a corrupted or incomplete deployment."
+        ) from exc
 
 _is_sensitive_identifier = is_sensitive_field
 

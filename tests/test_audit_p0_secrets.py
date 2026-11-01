@@ -335,3 +335,45 @@ def test_s06_origin_url_strictness_and_metadata(tmp_path: Path):
     assert meta["url"] == "https://example.com:9000"
     assert "auth" not in meta["url"]
     assert "param" not in meta["url"]
+
+
+def test_s07_fail_closed_on_missing_redaction_module(tmp_path: Path, monkeypatch):
+    """FIX 1: Instantiating/importing emitted app or driver without redaction module raises RuntimeError."""
+    import importlib.util
+
+    dist_dir = tmp_path / "dist_no_redaction"
+    generator = JinjaCodeGenerator()
+    generator.emit(
+        dag={"workflow_name": "RedactionFailSafe", "target_url": "http://example.com", "nodes": {}, "edges": []},
+        segments=[],
+        out_dir=dist_dir,
+    )
+
+    # Delete copied redaction.py from dist
+    redaction_file = dist_dir / "redaction.py"
+    if redaction_file.exists():
+        redaction_file.unlink()
+
+    # Block both redaction and ocular.security.redaction from being imported
+    sys.modules.pop("playwright_driver", None)
+    sys.modules.pop("app", None)
+    monkeypatch.syspath_prepend(str(dist_dir))
+    monkeypatch.setitem(sys.modules, "redaction", None)
+    monkeypatch.setitem(sys.modules, "ocular.security.redaction", None)
+
+    # 1. Assert driver fails closed with RuntimeError
+    driver_path = dist_dir / "playwright_driver.py"
+    spec_driver = importlib.util.spec_from_file_location("test_driver_no_redaction", driver_path)
+    assert spec_driver and spec_driver.loader
+    mod_driver = importlib.util.module_from_spec(spec_driver)
+    with pytest.raises(RuntimeError, match="redaction module unavailable"):
+        spec_driver.loader.exec_module(mod_driver)
+
+    # 2. Assert app fails closed with RuntimeError
+    app_path = dist_dir / "app.py"
+    spec_app = importlib.util.spec_from_file_location("test_app_no_redaction", app_path)
+    assert spec_app and spec_app.loader
+    mod_app = importlib.util.module_from_spec(spec_app)
+    with pytest.raises(RuntimeError, match="redaction module unavailable"):
+        spec_app.loader.exec_module(mod_app)
+

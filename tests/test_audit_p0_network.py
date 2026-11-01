@@ -6,6 +6,7 @@ import socket
 import threading
 import time
 from typing import Any, Dict, List
+from urllib.parse import urlsplit
 import pytest
 from playwright.async_api import async_playwright
 
@@ -429,4 +430,102 @@ async def test_response_caps_size_and_time():
             await browser.close()
     finally:
         server.shutdown()
+
+
+def test_normalize_host_ipv6_bracket_and_port():
+    """FIX 3: normalize_host handles IPv6 bracket + port, bare bracket, and raw IPv6."""
+    from ocular.security.netguard import normalize_host
+
+    assert normalize_host("[::1]:8080") == "::1"
+    assert normalize_host("[::1]") == "::1"
+    assert normalize_host("::1") == "::1"
+    assert normalize_host("[2001:db8::1]:443") == "2001:db8::1"
+    assert normalize_host("[2001:db8::1]") == "2001:db8::1"
+    assert normalize_host("2001:db8::1") == "2001:db8::1"
+
+
+@pytest.mark.asyncio
+async def test_egress_proxy_dns_rebinding_pinned_to_validated_ip(monkeypatch):
+    """FIX 2: DNS-rebinding TOCTOU mitigation in start_egress_proxy.
+    
+    Simulates a DNS rebinding attack where the resolver returns a public IP on the
+    first lookup and private 127.0.0.1 on subsequent lookups.
+    Verifies that the proxy connects directly to the first validated IP literal,
+    preventing open_connection from re-resolving the hostname to 127.0.0.1.
+    """
+    from ocular.security.netguard import start_egress_proxy, _DNS_CACHE
+    _DNS_CACHE.clear()
+
+    call_count = 0
+
+    async def rebinding_resolver(host, port):
+        nonlocal call_count
+        call_count += 1
+        # Calls 1 & 2 return public IP; subsequent calls return private 127.0.0.1
+        if call_count <= 2:
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+
+    connected_destinations = []
+    real_open_connection = asyncio.open_connection
+
+    proxy_srv, proxy_url = await start_egress_proxy(custom_resolver=rebinding_resolver)
+    parsed_proxy = urlsplit(proxy_url)
+    proxy_host, proxy_port = parsed_proxy.hostname, parsed_proxy.port
+
+    async def mock_open_connection(host, port, *args, **kwargs):
+        if (host, port) == (proxy_host, proxy_port):
+            return await real_open_connection(host, port, *args, **kwargs)
+        connected_destinations.append((host, port))
+        raise ConnectionRefusedError("Simulated upstream close after capturing pinned target")
+
+    monkeypatch.setattr(asyncio, "open_connection", mock_open_connection)
+
+    try:
+        # 1. Plain HTTP request through proxy
+        r, w = await asyncio.open_connection(proxy_host, proxy_port)
+        w.write(b"GET http://rebind.attacker.com:80/data HTTP/1.1\r\nHost: rebind.attacker.com\r\n\r\n")
+        await w.drain()
+        resp_data = await r.read(1024)
+        w.close()
+        await w.wait_closed()
+
+        # Upstream open_connection must have been called with the pinned validated IP literal
+        assert len(connected_destinations) == 1
+        assert connected_destinations[0] == ("93.184.216.34", 80)
+        assert connected_destinations[0][0] != "127.0.0.1"
+        assert connected_destinations[0][0] != "rebind.attacker.com"
+
+        # 2. CONNECT request through proxy
+        r2, w2 = await asyncio.open_connection(proxy_host, proxy_port)
+        w2.write(b"CONNECT rebind-tls.attacker.com:443 HTTP/1.1\r\nHost: rebind-tls.attacker.com\r\n\r\n")
+        await w2.drain()
+        resp_data2 = await r2.read(1024)
+        w2.close()
+        await w2.wait_closed()
+
+        # CONNECT must also connect directly to the pinned validated IP literal
+        assert len(connected_destinations) == 2
+        assert connected_destinations[1] == ("93.184.216.34", 443)
+        assert connected_destinations[1][0] != "127.0.0.1"
+        assert connected_destinations[1][0] != "rebind-tls.attacker.com"
+
+        # 3. Third request after DNS rebinding to 127.0.0.1: proxy must block with 403
+        _DNS_CACHE.clear()
+        r3, w3 = await asyncio.open_connection(proxy_host, proxy_port)
+        w3.write(b"GET http://rebind-private.attacker.com:80/secret HTTP/1.1\r\nHost: rebind-private.attacker.com\r\n\r\n")
+        await w3.drain()
+        resp_data3 = await r3.read(1024)
+        w3.close()
+        await w3.wait_closed()
+
+        assert b"403 Forbidden" in resp_data3
+        assert b"SSRF Policy Blocked" in resp_data3
+        # No additional connection attempt made to upstream for blocked private IP
+        assert len(connected_destinations) == 2
+
+    finally:
+        proxy_srv.close()
+        await proxy_srv.wait_closed()
+
 

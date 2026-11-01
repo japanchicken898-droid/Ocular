@@ -238,9 +238,14 @@ def normalize_host(host: Any) -> Optional[str]:
     # NFKC normalization (converts fullwidth digits like １２７.０.０.１ to 127.0.0.1)
     norm = unicodedata.normalize("NFKC", host.strip()).lower()
 
-    # Strip IPv6 enclosing brackets
-    if norm.startswith("[") and norm.endswith("]"):
-        norm = norm[1:-1]
+    # Strip IPv6 enclosing brackets and optional port (e.g. [::1]:8080, [::1])
+    if norm.startswith("["):
+        close_bracket = norm.find("]")
+        if close_bracket != -1:
+            rest = norm[close_bracket + 1:]
+            if rest and not rest.startswith(":"):
+                return None
+            norm = norm[1:close_bracket]
 
     # Strip IPv6 zone id (%eth0)
     if "%" in norm:
@@ -473,34 +478,62 @@ def is_private_url(url_or_host: Any, allowed_hosts: Optional[Set[str]] = None) -
         return True
 
 
-async def resolve_and_check_host(
+async def resolve_safe_ip(
     host: str,
     port: Optional[int] = None,
     allowed_hosts: Optional[Set[str]] = None,
     custom_resolver: Optional[Callable] = None,
-) -> bool:
-    """Asynchronously resolves a host and checks all returned IP addresses against blocked subnets.
+) -> Optional[str]:
+    """Asynchronously resolves a host and validates all returned IP addresses against blocked subnets.
     
-    Caches verdicts via a bounded TTL LRU cache (5s for allow, 2s for transient error/failure).
-    Fail-closed on resolution errors. Returns True if blocked, False if permitted.
+    If permitted, returns the first validated safe IP literal string (e.g. '93.184.216.34').
+    If blocked or on resolution error, returns None (fails closed).
+    
+    This function eliminates DNS rebinding TOCTOU vulnerabilities by resolving and validating
+    the IP address once, allowing callers to connect directly to the returned IP literal.
     """
     clean_host = normalize_host(host)
     if not clean_host:
-        return True
+        return None
 
     active_allowlist = allowed_hosts if allowed_hosts is not None else get_allowed_hosts()
+
+    # If host:port is explicitly allowlisted
     if is_host_allowed(clean_host, port, active_allowlist):
-        return False
+        parsed_ip = parse_legacy_ipv4(clean_host)
+        if parsed_ip is None:
+            try:
+                parsed_ip = ipaddress.ip_address(clean_host)
+            except ValueError:
+                pass
+        if parsed_ip is not None:
+            return str(parsed_ip)
+
+    # Check if clean_host is already an IP address
+    parsed_ip = parse_legacy_ipv4(clean_host)
+    if parsed_ip is None:
+        try:
+            parsed_ip = ipaddress.ip_address(clean_host)
+        except ValueError:
+            pass
+
+    if parsed_ip is not None:
+        if host_is_blocked(str(parsed_ip), port=port, allowed_hosts=active_allowlist):
+            return None
+        return str(parsed_ip)
 
     cache_key = f"{clean_host}:{port}" if port else clean_host
-    cached_verdict = _DNS_CACHE.get(cache_key)
-    if cached_verdict is not None:
-        return cached_verdict
+    cached_val = _DNS_CACHE.get(cache_key)
+    if cached_val is not None:
+        if cached_val is True or cached_val == "":
+            return None
+        if isinstance(cached_val, str) and cached_val:
+            return cached_val
 
     # Static host check
     if host_is_blocked(clean_host, port=port, allowed_hosts=active_allowlist):
-        _DNS_CACHE.set(cache_key, True, ttl=5.0)
-        return True
+        _DNS_CACHE.set(cache_key, "", ttl=5.0)
+        return None
 
     # Async DNS resolution bounded by semaphore and thread pool
     try:
@@ -523,22 +556,49 @@ async def resolve_and_check_host(
                 )
 
         if not addr_info:
-            _DNS_CACHE.set(cache_key, True, ttl=2.0)
-            return True
+            _DNS_CACHE.set(cache_key, "", ttl=2.0)
+            return None
 
         # Check every resolved IP address
+        safe_ip: Optional[str] = None
         for entry in addr_info:
             ip_str = entry[4][0]
             if host_is_blocked(ip_str, port=port, allowed_hosts=active_allowlist):
-                _DNS_CACHE.set(cache_key, True, ttl=5.0)
-                return True
+                _DNS_CACHE.set(cache_key, "", ttl=5.0)
+                return None
+            if safe_ip is None:
+                safe_ip = ip_str
 
-        _DNS_CACHE.set(cache_key, False, ttl=5.0)
-        return False
+        if safe_ip:
+            # Narrow allowed cache TTL to 2.0s to minimize DNS rebinding exposure window
+            _DNS_CACHE.set(cache_key, safe_ip, ttl=2.0)
+            return safe_ip
+
+        _DNS_CACHE.set(cache_key, "", ttl=2.0)
+        return None
     except Exception as exc:
         logger.debug(f"DNS resolution failure for '{clean_host}': {exc}; failing closed with 2s TTL.")
-        _DNS_CACHE.set(cache_key, True, ttl=2.0)
-        return True
+        _DNS_CACHE.set(cache_key, "", ttl=2.0)
+        return None
+
+
+async def resolve_and_check_host(
+    host: str,
+    port: Optional[int] = None,
+    allowed_hosts: Optional[Set[str]] = None,
+    custom_resolver: Optional[Callable] = None,
+) -> bool:
+    """Asynchronously resolves a host and checks all returned IP addresses against blocked subnets.
+    
+    Fail-closed on resolution errors. Returns True if blocked, False if permitted.
+    """
+    safe_ip = await resolve_safe_ip(
+        host=host,
+        port=port,
+        allowed_hosts=allowed_hosts,
+        custom_resolver=custom_resolver,
+    )
+    return safe_ip is None
 
 
 MAX_REDIRECTS = 5
@@ -592,7 +652,15 @@ async def setup_confinement_routes(
                     return
 
                 # 4. Validate host and resolved IP addresses
-                if await resolve_and_check_host(hostname, port=port, allowed_hosts=active_allowlist):
+                # NOTE on Playwright route.fetch():
+                # In Playwright Python (>= 1.48.0), route.fetch() delegates to Chromium's internal network
+                # stack and does not expose an API to pin destination socket IP literals while preserving
+                # Host/SNI. To mitigate TOCTOU rebinding in route.fetch(), resolve_safe_ip() validates
+                # the host with a narrowed DNS cache TTL (2.0s). In production environments, kernel-level
+                # egress filtering (iptables / network namespaces) and the Ocular egress proxy serve as
+                # the authoritative IP confinement boundaries.
+                safe_ip = await resolve_safe_ip(hostname, port=port, allowed_hosts=active_allowlist)
+                if not safe_ip:
                     logger.warning(f"Aborting SSRF navigation to prohibited host/IP: {hostname}:{port}")
                     await route.abort("blockedbyclient")
                     return
@@ -695,7 +763,8 @@ async def setup_confinement_routes(
                     await res
                 return
 
-            if await resolve_and_check_host(hostname, port=port, allowed_hosts=active_allowlist):
+            safe_ip = await resolve_safe_ip(hostname, port=port, allowed_hosts=active_allowlist)
+            if not safe_ip:
                 logger.warning(f"Closing WebSocket to prohibited host: {hostname}")
                 res = ws_route.close(code=1008, reason="SSRF policy blocked")
                 if asyncio.iscoroutine(res):
@@ -728,6 +797,7 @@ async def start_egress_proxy(
     host: str = "127.0.0.1",
     port: int = 0,
     allowed_hosts: Optional[Set[str]] = None,
+    custom_resolver: Optional[Callable] = None,
 ) -> Tuple[asyncio.Server, str]:
     """Starts a lightweight asyncio forward / CONNECT HTTP proxy validating all outbound IPs.
     
@@ -767,7 +837,13 @@ async def start_egress_proxy(
                     if not line or line in (b"\r\n", b"\n"):
                         break
 
-                if await resolve_and_check_host(target_host, port=target_port, allowed_hosts=active_allowlist):
+                resolved_ip = await resolve_safe_ip(
+                    target_host,
+                    port=target_port,
+                    allowed_hosts=active_allowlist,
+                    custom_resolver=custom_resolver,
+                )
+                if not resolved_ip:
                     writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n\r\nSSRF Policy Blocked\r\n")
                     await writer.drain()
                     writer.close()
@@ -775,8 +851,9 @@ async def start_egress_proxy(
                     return
 
                 try:
+                    # Pin connection to validated IP literal to prevent DNS-rebinding TOCTOU
                     upstream_reader, upstream_writer = await asyncio.wait_for(
-                        asyncio.open_connection(target_host, target_port), timeout=5.0
+                        asyncio.open_connection(resolved_ip, target_port), timeout=5.0
                     )
                 except Exception:
                     writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
@@ -821,7 +898,13 @@ async def start_egress_proxy(
                     if line in (b"\r\n", b"\n"):
                         break
 
-                if await resolve_and_check_host(target_host, port=target_port, allowed_hosts=active_allowlist):
+                resolved_ip = await resolve_safe_ip(
+                    target_host,
+                    port=target_port,
+                    allowed_hosts=active_allowlist,
+                    custom_resolver=custom_resolver,
+                )
+                if not resolved_ip:
                     writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n\r\nSSRF Policy Blocked\r\n")
                     await writer.drain()
                     writer.close()
@@ -829,8 +912,9 @@ async def start_egress_proxy(
                     return
 
                 try:
+                    # Pin connection to validated IP literal to prevent DNS-rebinding TOCTOU
                     upstream_reader, upstream_writer = await asyncio.wait_for(
-                        asyncio.open_connection(target_host, target_port), timeout=5.0
+                        asyncio.open_connection(resolved_ip, target_port), timeout=5.0
                     )
                 except Exception:
                     writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
