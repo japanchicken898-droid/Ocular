@@ -11,6 +11,7 @@ All visual anchors, bounding boxes, and action routes were resolved offline at c
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import socket
 import time
@@ -20,6 +21,56 @@ from urllib.parse import urlparse
 from playwright.async_api import async_playwright, Page, Browser
 
 logger = logging.getLogger("ocular.driver")
+
+# Private/loopback subnets blocked during browser navigation to prevent SSRF via redirects
+BLOCKED_PRIVATE_NETWORKS = [
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+]
+_BLOCKED_NAV_NETWORKS = BLOCKED_PRIVATE_NETWORKS
+
+
+def _is_private_url(url: str) -> bool:
+    """Check if a URL resolves to a private/loopback subnet."""
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+        # Fast literal check for common loopback names
+        if hostname.lower() in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+            return True
+        try:
+            ip_obj = ipaddress.ip_address(hostname)
+            return any(ip_obj in net for net in BLOCKED_PRIVATE_NETWORKS)
+        except ValueError:
+            pass
+        # DNS-based check (synchronous, but used only in route handler for redirects)
+        try:
+            addr_info = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            for entry in addr_info:
+                ip_str = entry[4][0]
+                try:
+                    ip_obj = ipaddress.ip_address(ip_str)
+                    if any(ip_obj in net for net in BLOCKED_PRIVATE_NETWORKS):
+                        return True
+                except ValueError:
+                    continue
+        except socket.gaierror:
+            pass
+        return False
+    except Exception:
+        return False
+
+
+is_private_url = _is_private_url
 
 
 class {{ workflow_class_name }}:
@@ -91,6 +142,7 @@ class {{ workflow_class_name }}:
             "parameter_ref": {{ step.parameter_ref_repr }},
             "default_value": {{ step.default_value_repr }},
             "description": {{ step.description_repr }},
+            "timeout_ms": {{ step.timeout_ms | default("None", true) }},
         },
         {% endfor %}
     ]
@@ -202,8 +254,10 @@ class {{ workflow_class_name }}:
         anchor_id: str,
         norm_x: Optional[float] = None,
         norm_y: Optional[float] = None,
+        timeout_ms: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Hybrid resilient click: semantic accessibility primary with visual coordinate fallback."""
+        step_timeout = timeout_ms or self.semantic_timeout_ms
         anchor = self.ANCHORS.get(anchor_id)
         role = str(anchor.get("role", "")).lower() if anchor else ""
         aria_role = self.ROLE_MAPPING.get(role, role if role in ("button", "menuitem", "link", "tab") else None)
@@ -241,8 +295,8 @@ class {{ workflow_class_name }}:
 
             if locator is not None and await locator.count() > 0:
                 target_elem = locator.first
-                await target_elem.wait_for(state="visible", timeout=self.semantic_timeout_ms)
-                await target_elem.click(timeout=self.semantic_timeout_ms)
+                await target_elem.wait_for(state="visible", timeout=step_timeout)
+                await target_elem.click(timeout=step_timeout)
                 logger.info(f"Primary semantic accessibility click succeeded for '{anchor_id}' (role={aria_role})")
                 return {
                     "anchor": anchor_id,
@@ -273,8 +327,10 @@ class {{ workflow_class_name }}:
         value: str,
         norm_x: Optional[float] = None,
         norm_y: Optional[float] = None,
+        timeout_ms: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Hybrid resilient form filling: semantic accessibility primary with visual fallback."""
+        step_timeout = timeout_ms or self.semantic_timeout_ms
         anchor = self.ANCHORS.get(anchor_id, {})
         label = anchor.get("label", anchor_id)
         selector = anchor.get("suggested_selector", "")
@@ -308,8 +364,8 @@ class {{ workflow_class_name }}:
 
             if locator is not None and await locator.count() > 0:
                 target_elem = locator.first
-                await target_elem.wait_for(state="visible", timeout=self.semantic_timeout_ms)
-                await target_elem.fill(str(value), timeout=self.semantic_timeout_ms)
+                await target_elem.wait_for(state="visible", timeout=step_timeout)
+                await target_elem.fill(str(value), timeout=step_timeout)
                 logger.info(f"Primary semantic accessibility fill succeeded for '{anchor_id}'")
                 return {
                     "anchor": anchor_id,
@@ -384,6 +440,17 @@ class {{ workflow_class_name }}:
                 )
                 page: Page = await context.new_page()
 
+                # Browser-level redirect guard: block navigations to private/loopback subnets (SSRF defense)
+                async def _ssrf_route_guard(route):
+                    req_url = route.request.url
+                    if _is_private_url(req_url):
+                        logger.warning(f"Blocked browser navigation to private subnet: {req_url}")
+                        await route.abort("blockedbyclient")
+                    else:
+                        await route.continue_()
+
+                await page.route("**/*", _ssrf_route_guard)
+
                 target_nav_url = (self.base_url or self.TARGET_URL).rstrip("/")
 
                 # Step 0: Directly load canvas content if offline to prevent error flash
@@ -417,13 +484,14 @@ class {{ workflow_class_name }}:
                     norm_x = step.get("norm_x", 0.5)
                     norm_y = step.get("norm_y", 0.5)
                     param_ref = step.get("parameter_ref")
+                    step_timeout = step.get("timeout_ms")
 
                     if action in ("fill", "type", "input"):
                         val = parameters.get(param_ref, step.get("default_value", "")) if param_ref else step.get("default_value", "")
-                        step_res = await self.fill_target(page, target, val, norm_x=norm_x, norm_y=norm_y)
+                        step_res = await self.fill_target(page, target, val, norm_x=norm_x, norm_y=norm_y, timeout_ms=step_timeout)
                         steps_executed.append(step_res)
                     else:
-                        step_res = await self.click_target(page, target, norm_x=norm_x, norm_y=norm_y)
+                        step_res = await self.click_target(page, target, norm_x=norm_x, norm_y=norm_y, timeout_ms=step_timeout)
                         steps_executed.append(step_res)
 
                 if not self.headless:

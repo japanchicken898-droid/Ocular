@@ -345,6 +345,7 @@ class JinjaCodeGenerator(BaseGenerator):
                 "parameter_ref": param_ref,
                 "default_value": default_val,
                 "description": e.get("description", f"Step {idx + 1}: {action} on {target_id}"),
+                "timeout_ms": e.get("timeout_ms"),
             })
 
         # Fallback if no edges in DAG: create steps from segments
@@ -366,6 +367,7 @@ class JinjaCodeGenerator(BaseGenerator):
                     "parameter_ref": s.get("id") if action == "fill" else None,
                     "default_value": "",
                     "description": f"Step {idx + 1}: {action} on {s.get('id')}",
+                    "timeout_ms": s.get("timeout_ms"),
                 })
 
         return steps

@@ -440,4 +440,125 @@ def test_pydantic_422_parameter_validation_and_async_dns(tmp_path: Path):
             sys.path.remove(str(dist_dir.resolve()))
 
 
+def test_workflow_name_digit_sanitization():
+    """Verify that domains/IPs starting with numbers resolve to valid Python identifiers prepended with 'Workflow_'."""
+    name_ip = derive_workflow_name_from_url("http://127.0.0.1:8000")
+    assert name_ip.startswith("Workflow_")
+    assert name_ip.isidentifier()
+    assert name_ip == "Workflow_127Workflow"
+
+    name_domain = derive_workflow_name_from_url("https://1password.com")
+    assert name_domain.startswith("Workflow_")
+    assert name_domain.isidentifier()
+    assert name_domain == "Workflow_1passwordWorkflow"
+
+    name_raw = sanitize_workflow_class_name("42Workflow")
+    assert name_raw.startswith("Workflow_")
+    assert name_raw.isidentifier()
+
+
+def test_samples_package_collection():
+    """Verify samples package imports cleanly and generate_synthetic_screen_recording is callable."""
+    import samples
+    from samples.create_sample_video import generate_synthetic_screen_recording
+
+    assert hasattr(samples, "__file__")
+    assert callable(generate_synthetic_screen_recording)
+
+
+def test_driver_respects_step_timeout(tmp_path: Path):
+    """Verify that synthesized edge timeout_ms values are emitted into the driver and respected."""
+    generator = JinjaCodeGenerator()
+    dag = {
+        "workflow_name": "TimeoutTestWorkflow",
+        "nodes": {
+            "state_root": {"title": "Root"},
+            "state_done": {"title": "Done"},
+        },
+        "edges": [
+            {
+                "from_node": "state_root",
+                "to_node": "state_done",
+                "action": "click",
+                "trigger_element": "submit_btn",
+                "timeout_ms": 4500,
+            },
+            {
+                "from_node": "state_done",
+                "to_node": "state_done",
+                "action": "fill",
+                "trigger_element": "query_input",
+                "timeout_ms": 3200,
+            },
+        ],
+    }
+    segments = [
+        {"id": "submit_btn", "bbox": {"x": 0.1, "y": 0.2, "width": 0.1, "height": 0.05}},
+        {"id": "query_input", "bbox": {"x": 0.3, "y": 0.4, "width": 0.2, "height": 0.05}},
+    ]
+
+    out_dir = tmp_path / "timeout_dist"
+    artifacts = generator.emit(dag=dag, segments=segments, out_dir=out_dir)
+
+    driver_code = artifacts["playwright_driver"].read_text(encoding="utf-8")
+    assert '"timeout_ms": 4500' in driver_code
+    assert '"timeout_ms": 3200' in driver_code
+
+    # Verify runtime driver instance has ACTION_STEPS with timeout_ms
+    import sys
+    import importlib
+
+    sys.modules.pop("playwright_driver", None)
+    sys.path.insert(0, str(out_dir.resolve()))
+    try:
+        driver_mod = importlib.import_module("playwright_driver")
+        workflow_cls = getattr(driver_mod, "TimeoutTestWorkflow", getattr(driver_mod, "OcularPlaywrightDriver"))
+        steps = workflow_cls.ACTION_STEPS
+        assert len(steps) == 2
+        assert steps[0]["timeout_ms"] == 4500
+        assert steps[1]["timeout_ms"] == 3200
+    finally:
+        sys.modules.pop("playwright_driver", None)
+        if str(out_dir.resolve()) in sys.path:
+            sys.path.remove(str(out_dir.resolve()))
+
+
+def test_browser_redirect_guard_blocks_private_ip(tmp_path: Path):
+    """Verify that private and loopback subnets (RFC 1918 / 3927) are blocked by driver guard."""
+    generator = JinjaCodeGenerator()
+    out_dir = tmp_path / "guard_dist"
+    generator.emit(dag={"workflow_name": "GuardWorkflow"}, segments=[], out_dir=out_dir)
+
+    import sys
+    import importlib
+
+    sys.modules.pop("playwright_driver", None)
+    sys.path.insert(0, str(out_dir.resolve()))
+    try:
+        driver_mod = importlib.import_module("playwright_driver")
+        assert hasattr(driver_mod, "BLOCKED_PRIVATE_NETWORKS")
+        is_priv = getattr(driver_mod, "is_private_url", getattr(driver_mod, "_is_private_url", None))
+        assert is_priv is not None
+
+        # Loopback
+        assert is_priv("http://127.0.0.1/admin") is True
+        assert is_priv("http://localhost:3000") is True
+
+        # Cloud metadata service (RFC 3927)
+        assert is_priv("http://169.254.169.254/latest/meta-data") is True
+
+        # RFC 1918 Private networks
+        assert is_priv("http://10.0.0.1/status") is True
+        assert is_priv("https://172.16.0.5:8443/internal") is True
+        assert is_priv("http://192.168.1.1/router") is True
+
+        # Public domains/IPs must not be flagged as private
+        assert is_priv("https://8.8.8.8") is False
+    finally:
+        sys.modules.pop("playwright_driver", None)
+        if str(out_dir.resolve()) in sys.path:
+            sys.path.remove(str(out_dir.resolve()))
+
+
+
 
