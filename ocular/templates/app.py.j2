@@ -31,10 +31,10 @@ _BASE_DIR = Path(__file__).resolve().parent
 if str(_BASE_DIR) not in sys.path:
     sys.path.insert(0, str(_BASE_DIR))
 
-from playwright_driver import {{ workflow_class_name }}, OcularPlaywrightDriver
+from playwright_driver import {{ workflow_class_name }}, WORKFLOW_DATA, OcularPlaywrightDriver
 
 COMPILE_HASH = "{{ compile_hash }}"
-WORKFLOW_NAME = getattr({{ workflow_class_name }}, "WORKFLOW_NAME", "OcularWorkflow")
+WORKFLOW_NAME = WORKFLOW_DATA.get("workflow_name", "OcularWorkflow")
 
 from netguard import (
     BLOCKED_IP_NETWORKS,
@@ -219,7 +219,7 @@ RESERVED_FIELD_NAMES = {
 
 
 def _build_execution_payload_model() -> Type[BaseModel]:
-    schema = getattr({{ workflow_class_name }}, "PARAMETERS_SCHEMA", {}) or {}
+    schema = WORKFLOW_DATA.get("parameters_schema", {}) or {}
     props = schema.get("properties", {})
     field_defs = {
         "viewport_width": (int, Field(default=1280, ge=200, le=3840, description="Browser viewport width in pixels")),
@@ -304,7 +304,7 @@ async def get_parameters_schema() -> Dict[str, Any]:
             p_def["description"] = f"Credential parameter {p_name}"
 
     clean_inputs = []
-    raw_inputs = getattr({{ workflow_class_name }}, "INPUT_FIELDS", [])
+    raw_inputs = WORKFLOW_DATA.get("input_fields", {})
     if isinstance(raw_inputs, dict):
         raw_inputs = list(raw_inputs.values())
     for inp in raw_inputs:
@@ -321,7 +321,7 @@ async def get_parameters_schema() -> Dict[str, Any]:
         "compile_hash": COMPILE_HASH,
         "parameters_schema": schema_dict,
         "input_parameters": clean_inputs,
-        "anchors_count": len(getattr({{ workflow_class_name }}, "ANCHORS", {})),
+        "anchors_count": len(WORKFLOW_DATA.get("anchors", {})),
         "zero_runtime_vision": True,
     }
 

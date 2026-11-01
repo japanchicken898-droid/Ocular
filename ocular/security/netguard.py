@@ -450,18 +450,27 @@ async def setup_confinement_routes(
 
             if blocked_port and port == blocked_port:
                 logger.warning(f"Closing WebSocket to explicitly blocked port {port}: {ws_url}")
-                ws_route.close(code=1008, reason="Blocked port policy")
+                res = ws_route.close(code=1008, reason="Blocked port policy")
+                if asyncio.iscoroutine(res):
+                    await res
                 return
 
             if await resolve_and_check_host(hostname, port=port, allowed_hosts=active_allowlist):
                 logger.warning(f"Closing WebSocket to prohibited host: {hostname}")
-                ws_route.close(code=1008, reason="SSRF policy blocked")
+                res = ws_route.close(code=1008, reason="SSRF policy blocked")
+                if asyncio.iscoroutine(res):
+                    await res
                 return
 
             ws_route.connect_to_server()
         except Exception as exc:
             logger.debug(f"Error in _ws_route_guard: {exc}; closing WebSocket.")
-            ws_route.close(code=1008, reason="Internal error")
+            try:
+                res = ws_route.close(code=1008, reason="Internal error")
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception:
+                pass
 
     # Register HTTP route guard using regex catching all schemes
     await context.route(re.compile(r".*"), _http_route_guard)

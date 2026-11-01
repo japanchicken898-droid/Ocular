@@ -111,6 +111,8 @@ if _WORKFLOW_JSON_PATH.exists():
 else:
     _WORKFLOW_DATA = {}
 
+WORKFLOW_DATA = _WORKFLOW_DATA
+
 
 class {{ workflow_class_name }}:
     """Scale-invariant Playwright driver operating on compile-time visual anchors."""
