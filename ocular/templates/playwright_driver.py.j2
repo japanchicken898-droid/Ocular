@@ -42,14 +42,18 @@ _BLOCKED_NAV_NETWORKS = BLOCKED_IP_NETWORKS
 _is_private_url = is_private_url
 
 
-def _is_sensitive_identifier(val: Any) -> bool:
-    if not val:
-        return False
-    text = str(val).lower()
-    if 'type="password"' in text or "type='password'" in text:
-        return True
-    pattern = r"(?:^|[^a-z0-9])(password|passwd|pwd|pass|passcode|passphrase|secret|token|jwt|bearer|session|cookie|otp|2fa|mfa|pin|ssn|cvv|cvc|csc|cardnumber|iban|routing|api[_\s-]?key|private[_\s-]?key|secret[_\s-]?key|access[_\s-]?key|auth[_\s-]?key|one[_\s-]?time(?:[_\s-]?code)?|cc[_\s-]?number|card[_\s-]?number|credit[_\s-]?card)(?:$|[^a-z0-9])"
-    return bool(re.search(pattern, text, re.IGNORECASE))
+try:
+    from redaction import is_sensitive_field, scrub_exception
+except ImportError:
+    try:
+        from ocular.security.redaction import is_sensitive_field, scrub_exception
+    except ImportError:
+        def is_sensitive_field(val: Any) -> bool:
+            return False
+        def scrub_exception(exc: Any, secrets: Any = None) -> str:
+            return str(exc)
+
+_is_sensitive_identifier = is_sensitive_field
 
 
 def _redact_workflow_results(res: Dict[str, Any]) -> Dict[str, Any]:
@@ -59,19 +63,22 @@ def _redact_workflow_results(res: Dict[str, Any]) -> Dict[str, Any]:
     anchors = _WORKFLOW_DATA.get("anchors", {})
 
     params = res.get("parameters")
+    secrets_to_scrub = []
     if isinstance(params, dict):
         redacted_params = {}
         for k, v in params.items():
             f_info = input_fields.get(k, {}) if isinstance(input_fields, dict) else {}
             a_info = anchors.get(k, {}) if isinstance(anchors, dict) else {}
             is_sens = (
-                _is_sensitive_identifier(k)
-                or _is_sensitive_identifier(f_info.get("selector"))
-                or _is_sensitive_identifier(f_info.get("label"))
-                or _is_sensitive_identifier(a_info.get("suggested_selector"))
-                or _is_sensitive_identifier(a_info.get("label"))
+                is_sensitive_field(k)
+                or is_sensitive_field(f_info.get("selector"))
+                or is_sensitive_field(f_info.get("label"))
+                or is_sensitive_field(a_info.get("suggested_selector"))
+                or is_sensitive_field(a_info.get("label"))
             )
             if is_sens:
+                if v:
+                    secrets_to_scrub.append(str(v))
                 redacted_params[k] = "[REDACTED]"
             else:
                 redacted_params[k] = v
@@ -87,17 +94,23 @@ def _redact_workflow_results(res: Dict[str, Any]) -> Dict[str, Any]:
                 f_info = input_fields.get(param_ref, {}) if isinstance(input_fields, dict) else {}
                 a_info = anchors.get(anchor, {}) if isinstance(anchors, dict) else {}
                 is_sens = (
-                    _is_sensitive_identifier(anchor)
-                    or _is_sensitive_identifier(param_ref)
-                    or _is_sensitive_identifier(selector)
-                    or _is_sensitive_identifier(f_info.get("selector"))
-                    or _is_sensitive_identifier(f_info.get("label"))
-                    or _is_sensitive_identifier(a_info.get("suggested_selector"))
-                    or _is_sensitive_identifier(a_info.get("label"))
+                    is_sensitive_field(anchor)
+                    or is_sensitive_field(param_ref)
+                    or is_sensitive_field(selector)
+                    or is_sensitive_field(f_info.get("selector"))
+                    or is_sensitive_field(f_info.get("label"))
+                    or is_sensitive_field(a_info.get("suggested_selector"))
+                    or is_sensitive_field(a_info.get("label"))
                 )
                 if is_sens:
                     if "value" in s and s["value"] is not None:
+                        if s["value"]:
+                            secrets_to_scrub.append(str(s["value"]))
                         s["value"] = "[REDACTED]"
+
+    if "error" in res and res["error"]:
+        res["error"] = scrub_exception(res["error"], secrets=secrets_to_scrub)
+
     return res
 
 
@@ -496,8 +509,18 @@ class {{ workflow_class_name }}:
                 raw_target_url = (self.base_url or self.TARGET_URL).rstrip("/")
                 try:
                     target_nav_url = canonicalize_url(raw_target_url)
-                except Exception:
-                    target_nav_url = raw_target_url
+                except Exception as canon_exc:
+                    return _redact_workflow_results({
+                        "status": "error",
+                        "success": False,
+                        "error_code": "TARGET_BLOCKED",
+                        "error": f"Target URL canonicalization failed: {canon_exc}",
+                        "workflow": self.WORKFLOW_NAME,
+                        "parameters": active_inputs,
+                        "latency_ms": round((time.perf_counter() - t_start) * 1000.0, 2),
+                        "steps": [],
+                        "compile_hash": self.COMPILE_HASH,
+                    })
 
                 active_allowed = set(get_allowed_hosts())
                 try:
@@ -520,9 +543,18 @@ class {{ workflow_class_name }}:
                 try:
                     response = await page.goto(target_nav_url, wait_until="domcontentloaded", timeout=self.semantic_timeout_ms)
                 except Exception as nav_exc:
+                    err_str = str(nav_exc)
+                    if "ERR_BLOCKED_BY_CLIENT" in err_str or "TARGET_BLOCKED" in err_str or "prohibited" in err_str:
+                        err_code = "TARGET_BLOCKED"
+                    elif "Timeout" in err_str or "timed out" in err_str.lower():
+                        err_code = "TIMEOUT"
+                    else:
+                        err_code = "NAV_FAILED"
+
                     return _redact_workflow_results({
                         "status": "error",
                         "success": False,
+                        "error_code": err_code,
                         "error": f"Live connection to '{target_nav_url}' failed: {nav_exc}",
                         "workflow": self.WORKFLOW_NAME,
                         "parameters": active_inputs,
@@ -536,6 +568,7 @@ class {{ workflow_class_name }}:
                     return _redact_workflow_results({
                         "status": "error",
                         "success": False,
+                        "error_code": "NAV_HTTP_ERROR",
                         "error": f"Navigation to '{target_nav_url}' returned HTTP {resp_status}",
                         "workflow": self.WORKFLOW_NAME,
                         "parameters": active_inputs,
@@ -579,6 +612,7 @@ class {{ workflow_class_name }}:
                     return _redact_workflow_results({
                         "status": "error",
                         "success": False,
+                        "error_code": "STEP_UNVERIFIED",
                         "error": unverified_error or "Workflow step postcondition verification failed",
                         "workflow": self.WORKFLOW_NAME,
                         "parameters": active_inputs,
@@ -597,9 +631,12 @@ class {{ workflow_class_name }}:
                     "compile_hash": self.COMPILE_HASH,
                 })
         except Exception as e:
+            err_str = str(e)
+            err_code = "TIMEOUT" if ("Timeout" in err_str or "timed out" in err_str.lower()) else "INTERNAL_ERROR"
             return _redact_workflow_results({
                 "status": "error",
                 "success": False,
+                "error_code": err_code,
                 "error": f"Execution failed: {e}",
                 "workflow": self.WORKFLOW_NAME,
                 "parameters": active_inputs,

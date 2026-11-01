@@ -185,20 +185,41 @@ async def limit_request_body_size(request: Request, call_next):
     return await call_next(request)
 
 
-def _is_sensitive_identifier(val: Any) -> bool:
-    if not val:
-        return False
-    text = str(val).lower()
-    if 'type="password"' in text or "type='password'" in text:
-        return True
-    pattern = r"(?:^|[^a-z0-9])(password|passwd|pwd|pass|passcode|passphrase|secret|token|jwt|bearer|session|cookie|otp|2fa|mfa|pin|ssn|cvv|cvc|csc|cardnumber|iban|routing|api[_\s-]?key|private[_\s-]?key|secret[_\s-]?key|access[_\s-]?key|auth[_\s-]?key|one[_\s-]?time(?:[_\s-]?code)?|cc[_\s-]?number|card[_\s-]?number|credit[_\s-]?card)(?:$|[^a-z0-9])"
-    return bool(re.search(pattern, text, re.IGNORECASE))
+try:
+    from redaction import is_sensitive_field, scrub_exception
+except ImportError:
+    try:
+        from ocular.security.redaction import is_sensitive_field, scrub_exception
+    except ImportError:
+        def is_sensitive_field(val: Any) -> bool:
+            return False
+        def scrub_exception(exc: Any, secrets: Any = None) -> str:
+            return str(exc)
+
+_is_sensitive_identifier = is_sensitive_field
+
+
+def classify_error_code(err: str, status_code: Optional[int] = None) -> str:
+    """Classifies raw errors into stable sanitized error codes."""
+    err_lower = (err or "").lower()
+    if "target_blocked" in err_lower or "blocked by client" in err_lower or "blocked_by_client" in err_lower or "prohibited" in err_lower or "ssrf" in err_lower:
+        return "TARGET_BLOCKED"
+    if "timeout" in err_lower or "timed out" in err_lower or "deadline exceeded" in err_lower:
+        return "TIMEOUT"
+    if "postcondition" in err_lower or "unverified" in err_lower or "step_unverified" in err_lower:
+        return "STEP_UNVERIFIED"
+    if "http 4" in err_lower or "http 5" in err_lower or (status_code and status_code >= 400):
+        return "NAV_HTTP_ERROR"
+    if "connection refused" in err_lower or "err_connection" in err_lower or "failed to connect" in err_lower or "name not resolved" in err_lower or "nav_failed" in err_lower:
+        return "NAV_FAILED"
+    return "INTERNAL_ERROR"
 
 
 def _sanitize_error_message(err: str) -> str:
     """Removes file paths, internal IPs, and raw stack traces from user-facing error messages."""
     if not err:
         return "Workflow execution failed."
+    err = scrub_exception(err)
     err = re.sub(r'Traceback \(most recent call last\):.*?\n(?=[a-zA-Z0-9_]+:)', '', err, flags=re.DOTALL)
     err = re.sub(r'File ".*?", line \d+, in .*', '', err)
     err = re.sub(r'(?:/|[a-zA-Z]:\\)[\w\-./\\]+', '[PATH]', err)
@@ -278,6 +299,7 @@ class ExecuteWorkflowResponse(BaseModel):
     steps_executed: int
     results: Dict[str, Any]
     errors: Optional[List[str]] = None
+    error_code: Optional[str] = None
 
 
 @app.get("/", include_in_schema=False)
@@ -407,6 +429,7 @@ async def execute_workflow(
             result = {
                 "status": "error",
                 "success": False,
+                "error_code": "TIMEOUT",
                 "error": "Execution deadline exceeded",
                 "steps": [],
             }
@@ -419,7 +442,10 @@ async def execute_workflow(
         success_status = result.get("success", result.get("status") == "success")
         raw_err = result.get("error")
         sanitized_err = None
+        err_code = None
         if not success_status:
+            err_code = result.get("error_code") or classify_error_code(raw_err or "")
+            result["error_code"] = err_code
             sanitized_err = [_sanitize_error_message(raw_err or "Execution failed")]
             response.status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
 
@@ -432,12 +458,14 @@ async def execute_workflow(
             steps_executed=len(steps),
             results=result,
             errors=sanitized_err,
+            error_code=err_code,
         )
     except Exception as exc:
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
         response.headers["X-Ocular-Compile-Hash"] = COMPILE_HASH
         response.headers["X-Execution-Latency-MS"] = str(latency_ms)
         response.status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+        err_code = classify_error_code(str(exc))
 
         return ExecuteWorkflowResponse(
             success=False,
@@ -446,8 +474,9 @@ async def execute_workflow(
             compile_hash=COMPILE_HASH,
             latency_ms=latency_ms,
             steps_executed=0,
-            results={},
+            results={"error_code": err_code},
             errors=[_sanitize_error_message(str(exc))],
+            error_code=err_code,
         )
     finally:
         _execution_semaphore.release()

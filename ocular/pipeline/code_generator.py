@@ -312,10 +312,17 @@ def extract_origin_url(
         if not val or not isinstance(val, str):
             return None
         val_str = val.strip()
+        if "@" in val_str:
+            raise CompilationError(f"Target URL must not contain embedded user credentials: {val_str}")
         try:
             parsed = urlparse(val_str)
-            if parsed.scheme in ("http", "https") and parsed.hostname:
-                return val_str.rstrip("/")
+            if parsed.scheme.lower() in ("http", "https") and parsed.hostname:
+                host = parsed.hostname.lower()
+                port_str = f":{parsed.port}" if parsed.port and parsed.port not in (80, 443) else ""
+                path = parsed.path.rstrip("/")
+                return f"{parsed.scheme.lower()}://{host}{port_str}{path}"
+        except CompilationError:
+            raise
         except Exception:
             pass
         return None
@@ -446,15 +453,12 @@ class JinjaCodeGenerator(BaseGenerator):
                     "target_selector": e.get("target_selector"),
                     "selector": e.get("target_selector"),
                 })
-                if is_sensitive:
+                if is_sensitive or key not in EXPLICIT_PARAMETER_ALLOWLIST:
                     default_val = ""
                     e["input_payload"] = "[REDACTED]"
                     e["default_value"] = ""
-                elif key in EXPLICIT_PARAMETER_ALLOWLIST:
-                    default_val = e.get("default_value", "sample_input")
                 else:
-                    default_val = ""
-                    e["default_value"] = ""
+                    default_val = e.get("default_value", "sample_input")
 
                 inputs.append(
                     {
@@ -503,15 +507,12 @@ class JinjaCodeGenerator(BaseGenerator):
                 "label": e.get("target_label"),
             })
 
-            if is_sensitive:
+            if is_sensitive or (not param_ref) or (param_ref not in EXPLICIT_PARAMETER_ALLOWLIST):
                 default_val = ""
                 e["input_payload"] = "[REDACTED]"
                 e["default_value"] = ""
-            elif param_ref and param_ref in EXPLICIT_PARAMETER_ALLOWLIST:
-                default_val = e.get("default_value") or ""
             else:
-                default_val = ""
-                e["default_value"] = ""
+                default_val = e.get("default_value") or ""
 
             steps.append({
                 "step_index": idx + 1,
@@ -739,12 +740,25 @@ class JinjaCodeGenerator(BaseGenerator):
         )
 
         # 4. Save state_graph.json
+        clean_dag = copy.deepcopy(dag)
+        for edge in clean_dag.get("edges", []):
+            p_ref = edge.get("parameter_ref")
+            is_sens = is_sensitive_field(edge)
+            if is_sens or (not p_ref) or (p_ref not in EXPLICIT_PARAMETER_ALLOWLIST):
+                if "input_payload" in edge:
+                    edge["input_payload"] = "[REDACTED]"
+                if "default_value" in edge:
+                    edge["default_value"] = ""
+            for ev_list_key in ("events", "telemetry_events", "keypresses"):
+                if ev_list_key in edge and isinstance(edge[ev_list_key], list):
+                    edge[ev_list_key] = [redact_event(ev) for ev in edge[ev_list_key] if isinstance(ev, dict)]
+
         state_graph_file = out_path / "state_graph.json"
         self._safe_write_text(
             state_graph_file,
             json.dumps(
                 {
-                    "dag": dag,
+                    "dag": clean_dag,
                     "workflow_class_name": workflow_class_name,
                     "compile_hash": compile_hash,
                     "action_steps": cleaned_steps,
@@ -767,6 +781,12 @@ class JinjaCodeGenerator(BaseGenerator):
         netguard_dst = out_path / "netguard.py"
         self._safe_write_text(netguard_dst, netguard_src.read_text(encoding="utf-8"))
 
+        # 7. Copy redaction.py (unified secrets redaction and exception scrubbing engine)
+        import ocular.security.redaction as redaction_module
+        redaction_src = Path(redaction_module.__file__)
+        redaction_dst = out_path / "redaction.py"
+        self._safe_write_text(redaction_dst, redaction_src.read_text(encoding="utf-8"))
+
         return {
             "playwright_driver": driver_file.resolve(),
             "app": app_file.resolve(),
@@ -775,6 +795,7 @@ class JinjaCodeGenerator(BaseGenerator):
             "workflow_dag_mermaid": mermaid_file.resolve(),
             "workflow_json": workflow_json_file.resolve(),
             "netguard": netguard_dst.resolve(),
+            "redaction": redaction_dst.resolve(),
         }
 
     def generate(

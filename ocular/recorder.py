@@ -18,7 +18,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
-from ocular.security.redaction import is_sensitive_field, redact_event
+from ocular.security.redaction import get_client_js_sensitive_check, is_sensitive_field, redact_event
 from ocular.telemetry import coerce_telemetry_event
 
 logger = logging.getLogger("ocular.recorder")
@@ -43,7 +43,7 @@ class OcularSessionRecorder:
             if (el.id) return '#' + el.id;
             let selector = (el.tagName || '').toLowerCase();
             if (el.className && typeof el.className === 'string') {
-                const classes = el.className.trim().split(/\\s+/).slice(0, 2).filter(Boolean);
+                const classes = el.className.trim().split(/\s+/).slice(0, 2).filter(Boolean);
                 if (classes.length > 0) {
                     selector += '.' + classes.join('.');
                 }
@@ -54,12 +54,8 @@ class OcularSessionRecorder:
             return selector;
         }
 
-        function checkSensitiveString(str) {
-            if (!str || typeof str !== 'string') return false;
-            if (str.toLowerCase().indexOf('type="password"') !== -1 || str.toLowerCase().indexOf("type='password'") !== -1) return true;
-            const sensitiveRegex = /(?:^|[^a-zA-Z0-9])(password|passwd|pwd|pass|passcode|passphrase|secret|token|jwt|bearer|session|cookie|otp|2fa|mfa|pin|ssn|cvv|cvc|csc|cardnumber|iban|routing|auth_key|auth-key|credit_card|credit-card|api_key|api-key|private_key|private-key|secret_key|secret-key|access_key|access-key|one-time-code|one_time_code|one-time|cc-number|cc_number|card_number|card-number)(?:$|[^a-zA-Z0-9])/i;
-            return sensitiveRegex.test(str);
-        }
+        __CLIENT_JS_SENSITIVE_CHECK__
+        window.checkSensitiveString = checkSensitiveString;
 
         function isSensitiveElement(el) {
             if (!el) return false;
@@ -164,6 +160,9 @@ class OcularSessionRecorder:
         }, true);
     })();
     """
+    _INIT_SCRIPT_TEMPLATE = _INIT_SCRIPT_TEMPLATE.replace(
+        "__CLIENT_JS_SENSITIVE_CHECK__", get_client_js_sensitive_check()
+    )
 
     TELEMETRY_INIT_SCRIPT = _INIT_SCRIPT_TEMPLATE.replace("__SESSION_NONCE__", "default_nonce")
 
@@ -329,6 +328,38 @@ class OcularSessionRecorder:
             return
         self.push_telemetry_event(event_data)
 
+    @staticmethod
+    def _sanitize_origin(url: str) -> str:
+        if not url:
+            return ""
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url.strip())
+            if parsed.scheme in ("http", "https") and parsed.hostname:
+                host = parsed.hostname.lower()
+                port = f":{parsed.port}" if parsed.port and parsed.port not in (80, 443) else ""
+                return f"{parsed.scheme.lower()}://{host}{port}"
+        except Exception:
+            pass
+        return url
+
+    def _write_session_metadata(self, url: str) -> None:
+        start_epoch_ms = int(time.time() * 1000)
+        sanitized = self._sanitize_origin(url)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            (self.out_dir / "session_metadata.json").write_text(
+                json.dumps({
+                    "url": sanitized,
+                    "origin": sanitized,
+                    "timestamp": time.time(),
+                    "start_timestamp_ms": start_epoch_ms,
+                }),
+                encoding="utf-8"
+            )
+        except Exception:
+            pass
+
     async def record_session(
         self,
         url: str,
@@ -342,18 +373,7 @@ class OcularSessionRecorder:
         self.telemetry_events.clear()
         self.truncated = False
         self._max_warning_logged = False
-        start_epoch_ms = int(time.time() * 1000)
-        try:
-            (self.out_dir / "session_metadata.json").write_text(
-                json.dumps({
-                    "url": url,
-                    "timestamp": time.time(),
-                    "start_timestamp_ms": start_epoch_ms,
-                }),
-                encoding="utf-8"
-            )
-        except Exception:
-            pass
+        self._write_session_metadata(url)
 
         start_time = time.perf_counter()
 
@@ -456,3 +476,7 @@ class OcularSessionRecorder:
                     except (json.JSONDecodeError, ValueError):
                         continue
         return events
+
+
+# Backward-compatibility alias
+SessionRecorder = OcularSessionRecorder
