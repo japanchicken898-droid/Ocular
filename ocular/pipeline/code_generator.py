@@ -17,10 +17,38 @@ from ocular.pipeline.base import BaseGenerator
 logger = logging.getLogger("ocular.pipeline.code_generator")
 
 
+SECRET_PATTERN = re.compile(
+    r"password|token|secret|credit_card|cvv|api_key|auth|bearer", re.IGNORECASE
+)
+
+
 def _sanitize_param_key(name: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", str(name).strip())
     if not cleaned or cleaned[0].isdigit():
         cleaned = f"param_{cleaned}"
+    return cleaned
+
+
+def sanitize_workflow_class_name(name: Optional[str]) -> str:
+    """Sanitizes a string to be a valid Python identifier for workflow class names.
+
+    Guarantees an alphabetic prefix and strips invalid characters.
+    """
+    if not name:
+        return "OcularWorkflow"
+
+    text = str(name).strip()
+    cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", text)
+    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+    if not cleaned:
+        cleaned = "Ocular"
+
+    if not cleaned[0].isalpha():
+        cleaned = f"Workflow_{cleaned}"
+
+    if not cleaned.endswith("Workflow"):
+        cleaned = f"{cleaned}Workflow"
+
     return cleaned
 
 
@@ -32,6 +60,7 @@ def derive_workflow_name_from_url(url_or_name: Optional[str], default: str = "Oc
         'excalidraw.com' -> 'ExcalidrawWorkflow'
         'https://example.com/chart' -> 'ExampleWorkflow'
         'http://localhost:3000' -> 'LocalhostWorkflow'
+        'http://127.0.0.1:8000' -> 'Workflow_127Workflow'
         'session_excalidraw' -> 'ExcalidrawWorkflow'
     """
     if not url_or_name:
@@ -42,8 +71,8 @@ def derive_workflow_name_from_url(url_or_name: Optional[str], default: str = "Oc
         return default
 
     # If already a valid PascalCase identifier ending with Workflow
-    if re.match(r"^[A-Z][a-zA-Z0-9]*Workflow$", text):
-        return text
+    if re.match(r"^[A-Za-z][a-zA-Z0-9_]*Workflow$", text):
+        return sanitize_workflow_class_name(text)
 
     # Extract hostname or path
     if "://" in text or text.startswith("http"):
@@ -74,10 +103,7 @@ def derive_workflow_name_from_url(url_or_name: Optional[str], default: str = "Oc
     if not pascal:
         pascal = "Ocular"
 
-    if not pascal.endswith("Workflow"):
-        pascal = f"{pascal}Workflow"
-
-    return pascal
+    return sanitize_workflow_class_name(pascal)
 
 
 def extract_telemetry_input_parameters(telemetry_events: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
@@ -113,12 +139,20 @@ def extract_telemetry_input_parameters(telemetry_events: Optional[List[Dict[str,
         clean_name = re.sub(r"[^a-zA-Z0-9_]+", "_", target_name).strip("_")
         key = _sanitize_param_key(clean_name or "input_text")
 
+        is_sensitive = bool(
+            SECRET_PATTERN.search(key)
+            or SECRET_PATTERN.search(target)
+            or "[REDACTED]" in default_val
+        )
+        if is_sensitive:
+            default_val = ""
+
         inputs.append({
             "key": key,
             "parameter_ref": key,
             "target_anchor": clean_name,
             "default_value": default_val,
-            "label": f"Input value for {target}",
+            "label": f"Input value for {target}" if not is_sensitive else f"Credential parameter {key}",
             "action": "fill",
             "selector": target,
         })
@@ -210,6 +244,14 @@ class JinjaCodeGenerator(BaseGenerator):
             lstrip_blocks=True,
         )
 
+    @staticmethod
+    def _safe_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
+        """Safely writes content to target path, rejecting or unlinking existing symlinks to prevent symlink traversal attacks."""
+        if path.is_symlink():
+            logger.warning(f"Rejecting existing symlink at {path}; unlinking before write.")
+            path.unlink()
+        path.write_text(content, encoding=encoding)
+
     def _compute_hash(self, dag: Dict[str, Any], segments: List[Dict[str, Any]]) -> str:
         payload = json.dumps({"dag": dag, "segments": segments}, sort_keys=True)
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
@@ -241,13 +283,23 @@ class JinjaCodeGenerator(BaseGenerator):
                 key = _sanitize_param_key(raw_key)
                 if key not in seen_keys:
                     seen_keys.add(key)
+                    default_val = e.get("default_value", e.get("input_payload", "sample_input"))
+                    is_sensitive = bool(
+                        SECRET_PATTERN.search(key)
+                        or SECRET_PATTERN.search(str(target_id))
+                        or SECRET_PATTERN.search(str(raw_key))
+                        or "[REDACTED]" in str(default_val)
+                    )
+                    if is_sensitive:
+                        default_val = ""
+
                     inputs.append(
                         {
                             "key": key,
                             "parameter_ref": key,
                             "target_anchor": target_id,
-                            "default_value": e.get("default_value", e.get("input_payload", "sample_input")),
-                            "label": e.get("target_label", key),
+                            "default_value": default_val,
+                            "label": e.get("target_label", key) if not is_sensitive else f"Credential parameter {key}",
                             "action": "fill",
                             "selector": e.get("target_selector"),
                         }
@@ -332,9 +384,12 @@ class JinjaCodeGenerator(BaseGenerator):
         # Derive workflow class name dynamically from URL domain or dag name
         raw_name = dag.get("target_url") or dag.get("url") or dag.get("workflow_name")
         workflow_class_name = derive_workflow_name_from_url(raw_name)
+        workflow_class_name = sanitize_workflow_class_name(workflow_class_name)
         dag["workflow_name"] = workflow_class_name
 
         compile_hash = self._compute_hash(dag, segments)
+        compile_hash_repr = json.dumps(compile_hash)
+        workflow_name_repr = json.dumps(workflow_class_name)
 
         # Extract dynamic inputs and generic action steps
         input_fields = self._extract_dynamic_inputs(dag, segments, telemetry_events=telemetry_events)
@@ -393,6 +448,14 @@ class JinjaCodeGenerator(BaseGenerator):
 
         target_url = extract_origin_url(dag, telemetry_events=telemetry_events, out_dir=out_path)
         dag["target_url"] = target_url
+        target_url_repr = json.dumps(target_url)
+
+        # Pre-serialize string attributes in segments, anchors, inputs, and action steps
+        for seg in segments:
+            seg["id_repr"] = json.dumps(str(seg.get("id", "")))
+            seg["label_repr"] = json.dumps(str(seg.get("label", seg.get("id", ""))))
+            seg["role_repr"] = json.dumps(str(seg.get("role", "element")))
+            seg["suggested_selector_repr"] = json.dumps(str(seg.get("suggested_selector") or ""))
 
         anchors = {}
         for seg in segments:
@@ -401,21 +464,46 @@ class JinjaCodeGenerator(BaseGenerator):
             norm_y = bbox.get("y", 0.0) + bbox.get("height", 0.0) / 2.0
             anchors[seg.get("id")] = {
                 "id": seg.get("id"),
+                "id_repr": seg["id_repr"],
                 "label": seg.get("label", seg.get("id")),
+                "label_repr": seg["label_repr"],
                 "role": seg.get("role", "element"),
+                "role_repr": seg["role_repr"],
                 "norm_x": round(float(norm_x), 4),
                 "norm_y": round(float(norm_y), 4),
                 "bbox": bbox,
                 "suggested_selector": seg.get("suggested_selector"),
+                "suggested_selector_repr": seg["suggested_selector_repr"],
             }
+
+        for inp in input_fields:
+            inp["key_repr"] = json.dumps(str(inp.get("key", "")))
+            inp["target_anchor_repr"] = json.dumps(str(inp.get("target_anchor", "")))
+            inp["default_value_repr"] = json.dumps(str(inp.get("default_value", "")))
+            inp["label_repr"] = json.dumps(str(inp.get("label", "")))
+            inp["action_repr"] = json.dumps(str(inp.get("action", "")))
+            inp["selector_repr"] = json.dumps(str(inp.get("selector") or ""))
+            inp["parameter_ref_repr"] = json.dumps(str(inp.get("parameter_ref", "")))
+
+        for step in action_steps:
+            step["action_repr"] = json.dumps(str(step.get("action", "")))
+            step["target_anchor_repr"] = json.dumps(str(step.get("target_anchor", "")))
+            step["selector_repr"] = json.dumps(str(step.get("selector"))) if step.get("selector") is not None else "None"
+            step["label_repr"] = json.dumps(str(step.get("label"))) if step.get("label") is not None else "None"
+            step["parameter_ref_repr"] = json.dumps(str(step.get("parameter_ref"))) if step.get("parameter_ref") is not None else "None"
+            step["default_value_repr"] = json.dumps(str(step.get("default_value", "")))
+            step["description_repr"] = json.dumps(str(step.get("description", "")))
 
         context = {
             "dag": dag,
             "workflow_class_name": workflow_class_name,
+            "workflow_name_repr": workflow_name_repr,
             "target_url": target_url,
+            "target_url_repr": target_url_repr,
             "segments": segments,
             "anchors": anchors,
             "compile_hash": compile_hash,
+            "compile_hash_repr": compile_hash_repr,
             "input_fields": input_fields,
             "input_keys": input_keys,
             "action_steps": action_steps,
@@ -427,22 +515,23 @@ class JinjaCodeGenerator(BaseGenerator):
         driver_tmpl = self.env.get_template("playwright_driver.py.j2")
         driver_code = driver_tmpl.render(context)
         driver_file = out_path / "playwright_driver.py"
-        driver_file.write_text(driver_code, encoding="utf-8")
+        self._safe_write_text(driver_file, driver_code)
 
         # 2. Render app.py (FastAPI microservice with /api/v1/execute)
         tmpl_name = "app.py.j2" if (self.templates_dir / "app.py.j2").exists() else "fastapi_app.py.j2"
         app_tmpl = self.env.get_template(tmpl_name)
         app_code = app_tmpl.render(context)
         app_file = out_path / "app.py"
-        app_file.write_text(app_code, encoding="utf-8")
+        self._safe_write_text(app_file, app_code)
 
         # 3. Write main.py
         main_file = out_path / "main.py"
-        main_file.write_text(app_code, encoding="utf-8")
+        self._safe_write_text(main_file, app_code)
 
         # 4. Save state_graph.json
         state_graph_file = out_path / "state_graph.json"
-        state_graph_file.write_text(
+        self._safe_write_text(
+            state_graph_file,
             json.dumps(
                 {
                     "dag": dag,
@@ -454,7 +543,6 @@ class JinjaCodeGenerator(BaseGenerator):
                 },
                 indent=2,
             ),
-            encoding="utf-8",
         )
 
         # 5. Save workflow_dag.mermaid
@@ -497,7 +585,10 @@ class JinjaCodeGenerator(BaseGenerator):
         }
 
         segments_list = []
-        if graph.initial_node_id in graph.nodes:
+        if hasattr(graph, "segments") and graph.segments:
+            for s in graph.segments.values():
+                segments_list.append(s.model_dump() if hasattr(s, "model_dump") else s)
+        elif graph.initial_node_id in graph.nodes and graph.nodes[graph.initial_node_id].segments:
             for s in graph.nodes[graph.initial_node_id].segments:
                 segments_list.append(s.model_dump())
 
@@ -515,7 +606,7 @@ class JinjaCodeGenerator(BaseGenerator):
             "transitions_count": len(graph.edges),
             "runtime_vision_inference": False,
         }
-        manifest_file.write_text(json.dumps(manifest_data, indent=2), encoding="utf-8")
+        self._safe_write_text(manifest_file, json.dumps(manifest_data, indent=2))
 
         return CompiledArtifacts(
             playwright_script_path=str(rendered["playwright_driver"]),

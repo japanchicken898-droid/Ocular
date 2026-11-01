@@ -242,16 +242,12 @@ class VideoIngestSampler:
 
         return video_info, transitions, sampled_frames
 
-    def ingest_timeline(
+    def _build_keyframe_index(
         self,
-        video_path: Union[str, Path],
-        telemetry_events: Optional[List[Dict[str, Any]]] = None,
+        video_info: Dict[str, Any],
+        raw_transitions: List[Dict[str, Any]],
+        raw_frames: List[np.ndarray],
     ) -> KeyframeIndex:
-        """Full extraction and temporal differencing emitting an indexed KeyframeIndex structure."""
-        video_info, raw_transitions, raw_frames = self.sample_transitions(
-            video_path, telemetry_events=telemetry_events
-        )
-
         frames_meta: List[FrameMetadata] = []
         keyframe_slices: List[KeyframeSlice] = []
         transition_events: List[TransitionEvent] = []
@@ -327,15 +323,28 @@ class VideoIngestSampler:
             slices=slices_map,
         )
 
+    def ingest_timeline(
+        self,
+        video_path: Union[str, Path],
+        telemetry_events: Optional[List[Dict[str, Any]]] = None,
+    ) -> KeyframeIndex:
+        """Full extraction and temporal differencing emitting an indexed KeyframeIndex structure."""
+        video_info, raw_transitions, raw_frames = self.sample_transitions(
+            video_path, telemetry_events=telemetry_events
+        )
+        return self._build_keyframe_index(video_info, raw_transitions, raw_frames)
+
     def process_video(
         self,
         video_path: Union[str, Path],
         telemetry_events: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[List[FrameMetadata], List[TransitionEvent], List[np.ndarray]]:
-        """Processes video recording and returns typed frames metadata and transitions."""
-        timeline = self.ingest_timeline(video_path, telemetry_events=telemetry_events)
-        _, _, all_sampled = self.sample_transitions(video_path, telemetry_events=telemetry_events)
-        return timeline.frames_meta, timeline.transitions, all_sampled
+        """Processes video recording in a single pass without duplicate decoding."""
+        video_info, raw_transitions, raw_frames = self.sample_transitions(
+            video_path, telemetry_events=telemetry_events
+        )
+        timeline = self._build_keyframe_index(video_info, raw_transitions, raw_frames)
+        return timeline.frames_meta, timeline.transitions, raw_frames
 
     def process_frames_list(
         self,

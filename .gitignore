@@ -44,3 +44,4 @@ recordings/
 
 dist_*/
 recordings/
+*.zip

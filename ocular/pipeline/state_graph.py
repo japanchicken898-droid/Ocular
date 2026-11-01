@@ -19,6 +19,10 @@ import urllib.request
 import networkx as nx
 from rich.tree import Tree
 
+SECRET_PATTERN = re.compile(
+    r"password|token|secret|credit_card|cvv|api_key|auth|bearer", re.IGNORECASE
+)
+
 def _sanitize_param_key(name: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", str(name).strip())
     if not cleaned or cleaned[0].isdigit():
@@ -87,11 +91,23 @@ class DAGBuilder(BaseSynthesizer):
                 raw_key = e.get("input_payload") or trigger
                 key = _sanitize_param_key(raw_key)
                 default_val = e.get("default_value", "sample_input")
+
+                # Redact sensitive parameters so secrets never leak into openapi.json/schemas
+                is_sensitive = bool(
+                    SECRET_PATTERN.search(key)
+                    or SECRET_PATTERN.search(str(trigger))
+                    or SECRET_PATTERN.search(str(raw_key))
+                    or "[REDACTED]" in str(default_val)
+                )
+                if is_sensitive:
+                    default_val = ""
+                    e["default_value"] = ""
+
                 if key not in properties:
                     properties[key] = {
                         "type": "string",
                         "default": default_val,
-                        "description": f"Input value for {trigger}",
+                        "description": f"Input value for {trigger}" if not is_sensitive else f"Credential parameter {key}",
                     }
                     required.append(key)
                 e["parameter_ref"] = key
@@ -129,11 +145,10 @@ class DAGBuilder(BaseSynthesizer):
         transitions: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Calls the live Baseten Meta Muse Spark endpoint using the standard OpenAI client."""
-        meta_key = os.getenv("META_MODEL_API_KEY")
         baseten_key = os.getenv("BASETEN_API_KEY")
-        if not meta_key:
+        if not baseten_key:
             return None
-        api_key = baseten_key or meta_key
+        api_key = baseten_key
 
         if OpenAI is None:
             return None
@@ -324,8 +339,8 @@ class DAGBuilder(BaseSynthesizer):
                         ndata["route"] = "/api/v1/chart/status" if "root" in nid else f"/api/v1/step/{nid}"
                     if "method" not in ndata:
                         ndata["method"] = "GET" if "root" in nid else "POST"
-                    if "segments" not in ndata or not ndata["segments"]:
-                        ndata["segments"] = segments
+                    if "segment_ids" not in ndata:
+                        ndata["segment_ids"] = [s.get("id") for s in segments if isinstance(s, dict) and "id" in s]
 
                 # Ensure canonical TradingView states if applicable
                 if "TradingView" in self.workflow_name and "state_interval_selected" not in data["nodes"]:
@@ -396,6 +411,7 @@ class DAGBuilder(BaseSynthesizer):
                     "root_node": root_node,
                     "terminal_node": terminal_node,
                     "parameters_schema": params_schema,
+                    "segments": {s["id"]: s for s in segments if isinstance(s, dict) and "id" in s},
                     "nodes": data["nodes"],
                     "edges": data["edges"],
                     "topological_order": topological_order,
@@ -497,7 +513,7 @@ class DAGBuilder(BaseSynthesizer):
                     "assertions": [f"expect({node_id}).to_be_active()"],
                     "route": f"/api/v1/step/{f_idx}",
                     "method": "POST" if f_idx > 0 else "GET",
-                    "segments": segments,
+                    "segment_ids": [s["id"] for s in segments if isinstance(s, dict) and "id" in s],
                 }
 
             # Build edges from transitions
@@ -623,7 +639,7 @@ class DAGBuilder(BaseSynthesizer):
                     "assertions": ["assert canvas.is_visible()"],
                     "route": "/api/v1/chart/status",
                     "method": "GET",
-                    "segments": segments,
+                    "segment_ids": [s["id"] for s in segments if isinstance(s, dict) and "id" in s],
                 },
                 "state_interval_menu_open": {
                     "id": "state_interval_menu_open",
@@ -652,7 +668,7 @@ class DAGBuilder(BaseSynthesizer):
                     "assertions": ["assert interval_menu.is_visible()"],
                     "route": "/api/v1/chart/interval/menu",
                     "method": "POST",
-                    "segments": segments,
+                    "segment_ids": [s["id"] for s in segments if isinstance(s, dict) and "id" in s],
                 },
                 "state_interval_selected": {
                     "id": "state_interval_selected",
@@ -676,7 +692,7 @@ class DAGBuilder(BaseSynthesizer):
                     "assertions": ["assert timeframe_applied.is_visible()"],
                     "route": "/api/v1/chart/interval",
                     "method": "POST",
-                    "segments": segments,
+                    "segment_ids": [s["id"] for s in segments if isinstance(s, dict) and "id" in s],
                 },
             }
 
@@ -728,6 +744,7 @@ class DAGBuilder(BaseSynthesizer):
             "root_node": root_node,
             "terminal_node": terminal_node,
             "parameters_schema": parameters_schema,
+            "segments": {s["id"]: s for s in segments if isinstance(s, dict) and "id" in s},
             "nodes": nodes,
             "edges": edges,
             "topological_order": topological_order,
@@ -793,6 +810,7 @@ class DAGBuilder(BaseSynthesizer):
                 url_pattern=ndata.get("url_pattern"),
                 assertions=ndata.get("assertions", []),
                 parameter_ref=ndata.get("parameter_ref"),
+                segment_ids=ndata.get("segment_ids", []),
             )
 
         typed_edges: List[DAGEdge] = []
@@ -825,8 +843,30 @@ class DAGBuilder(BaseSynthesizer):
             terminal_node_ids=[dag_dict["terminal_node"]],
             nodes=typed_nodes,
             edges=typed_edges,
+            segments=dag_dict.get("segments", {}),
             parameters_schema=dag_dict.get("parameters_schema"),
         )
+
+
+def _sanitize_mermaid_label(val: Any) -> str:
+    """Sanitizes text for Mermaid node titles and edge labels, neutralizing syntax-breaking chars."""
+    if val is None:
+        return ""
+    text = str(val)
+    # Strip control characters
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", text)
+    # Strip/replace quotes, backslashes, angle brackets
+    text = text.replace("\\", "/").replace('"', "'")
+    text = text.replace("<", "&lt;").replace(">", "&gt;")
+    return text.strip()
+
+
+def _sanitize_mermaid_id(nid: Any) -> str:
+    """Sanitizes node IDs to alphanumeric and underscores for valid Mermaid syntax."""
+    cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", str(nid).strip())
+    if not cleaned or cleaned[0].isdigit():
+        cleaned = f"node_{cleaned}"
+    return cleaned
 
 
 def generate_mermaid_dag(dag: Dict[str, Any]) -> str:
@@ -836,9 +876,10 @@ def generate_mermaid_dag(dag: Dict[str, Any]) -> str:
     root_node = dag.get("root_node", "state_root")
     terminal_node = dag.get("terminal_node", "")
 
+    wf_name = _sanitize_mermaid_label(dag.get("workflow_name", "Workflow"))
     lines = [
         "flowchart TD",
-        f"    %% Ocular Synthesized Workflow DAG: {dag.get('workflow_name', 'Workflow')}",
+        f"    %% Ocular Synthesized Workflow DAG: {wf_name}",
         "    classDef default fill:#1e1e2e,stroke:#89b4fa,stroke-width:2px,color:#cdd6f4;",
         "    classDef initNode fill:#181825,stroke:#a6e3a1,stroke-width:3px,color:#a6e3a1;",
         "    classDef termNode fill:#181825,stroke:#f38ba8,stroke-width:3px,color:#f38ba8;",
@@ -846,22 +887,26 @@ def generate_mermaid_dag(dag: Dict[str, Any]) -> str:
     ]
 
     for nid, ndata in nodes.items():
+        safe_nid = _sanitize_mermaid_id(nid)
         title = ndata.get("title", ndata.get("label", nid))
-        safe_title = title.replace('"', "'")
+        safe_title = _sanitize_mermaid_label(title)
         preconds = ndata.get("preconditions", [])
-        pre_desc = f"<br/><small>Pre: {preconds[0].get('type')}</small>" if preconds else ""
+        pre_desc = ""
+        if preconds:
+            pre_type = _sanitize_mermaid_label(preconds[0].get("type", ""))
+            pre_desc = f"<br/><small>Pre: {pre_type}</small>"
 
         node_style = ":::initNode" if nid == root_node else (":::termNode" if nid == terminal_node else ":::default")
-        lines.append(f'    {nid}["{safe_title}{pre_desc}"]{node_style}')
+        lines.append(f'    {safe_nid}["{safe_title}{pre_desc}"]{node_style}')
 
     lines.append("")
 
     for e in edges:
-        from_n = e.get("from_node")
-        to_n = e.get("to_node")
-        action = e.get("action_type") or e.get("action", "action")
-        target = e.get("trigger_element") or e.get("target_label", "target")
-        label = f"{action}: {target}".replace('"', "'")
+        from_n = _sanitize_mermaid_id(e.get("from_node", "from"))
+        to_n = _sanitize_mermaid_id(e.get("to_node", "to"))
+        action = _sanitize_mermaid_label(e.get("action_type") or e.get("action", "action"))
+        target = _sanitize_mermaid_label(e.get("trigger_element") or e.get("target_label", "target"))
+        label = _sanitize_mermaid_label(f"{action}: {target}")
         lines.append(f'    {from_n} -->|"{label}"| {to_n}')
 
     return "\n".join(lines) + "\n"
@@ -871,6 +916,8 @@ def export_mermaid_dag(dag: Dict[str, Any], output_path: Union[str, Path]) -> Pa
     """Exports the synthesized workflow DAG as a Mermaid diagram file."""
     out_file = Path(output_path)
     out_file.parent.mkdir(parents=True, exist_ok=True)
+    if out_file.is_symlink():
+        out_file.unlink()
     mermaid_content = generate_mermaid_dag(dag)
     out_file.write_text(mermaid_content, encoding="utf-8")
     return out_file

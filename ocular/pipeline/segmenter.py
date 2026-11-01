@@ -16,6 +16,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+import urllib.parse
 import urllib.request
 import cv2
 import numpy as np
@@ -316,6 +317,32 @@ class OpenCVHeuristicSegmenter(BaseSegmenter):
         return filtered
 
 
+class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Prevents Authorization token leakage on cross-origin or cross-protocol redirects."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_req is None:
+            return None
+
+        orig_parsed = urllib.parse.urlparse(req.full_url)
+        new_parsed = urllib.parse.urlparse(newurl)
+        if (
+            orig_parsed.hostname != new_parsed.hostname
+            or orig_parsed.port != new_parsed.port
+            or orig_parsed.scheme != new_parsed.scheme
+        ):
+            # Strip Authorization headers when redirecting to a different host, port, or scheme
+            if "Authorization" in new_req.headers:
+                del new_req.headers["Authorization"]
+            if "authorization" in new_req.headers:
+                del new_req.headers["authorization"]
+            new_req.remove_header("Authorization")
+            new_req.remove_header("authorization")
+
+        return new_req
+
+
 class MetaSAMSegmenter(BaseSegmenter):
     """Meta SAM 3.1 Segmentation stage with graceful local fallback.
 
@@ -402,7 +429,8 @@ class MetaSAMSegmenter(BaseSegmenter):
                 method="POST",
             )
 
-            with urllib.request.urlopen(req, timeout=12.0) as resp:
+            opener = urllib.request.build_opener(SafeRedirectHandler())
+            with opener.open(req, timeout=12.0) as resp:
                 if resp.status == 200:
                     self.last_inference_source = "meta_sam_3.1_api"
                     data = json.loads(resp.read().decode("utf-8"))

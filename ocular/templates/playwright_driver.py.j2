@@ -25,17 +25,17 @@ logger = logging.getLogger("ocular.driver")
 class {{ workflow_class_name }}:
     """Scale-invariant Playwright driver operating on compile-time visual anchors."""
 
-    COMPILE_HASH = "{{ compile_hash }}"
-    WORKFLOW_NAME = "{{ dag.workflow_name }}"
-    TARGET_URL = "{{ target_url }}"
+    COMPILE_HASH = {{ compile_hash_repr }}
+    WORKFLOW_NAME = {{ workflow_name_repr }}
+    TARGET_URL = {{ target_url_repr }}
 
     # Normalized relative coordinates (0.0 -> 1.0) synthesized offline by SAM 3.1
     ANCHORS = {
         {% for seg in segments %}
-        "{{ seg.id }}": {
-            "label": "{{ seg.label }}",
-            "role": "{{ seg.role }}",
-            "suggested_selector": "{{ seg.suggested_selector or '' }}",
+        {{ seg.id_repr }}: {
+            "label": {{ seg.label_repr }},
+            "role": {{ seg.role_repr }},
+            "suggested_selector": {{ seg.suggested_selector_repr }},
             "norm_x": {{ (seg.bbox.x + seg.bbox.width / 2.0) | round(4) }},
             "norm_y": {{ (seg.bbox.y + seg.bbox.height / 2.0) | round(4) }},
             "bbox": {
@@ -66,13 +66,13 @@ class {{ workflow_class_name }}:
     # Parameterized dynamic input fields
     INPUT_FIELDS = {
         {% for inp in input_fields %}
-        "{{ inp.key }}": {
-            "target_anchor": "{{ inp.target_anchor }}",
-            "default_value": "{{ inp.default_value }}",
-            "label": "{{ inp.label }}",
-            "action": "{{ inp.action }}",
-            "selector": "{{ inp.selector or '' }}",
-            "parameter_ref": "{{ inp.parameter_ref }}",
+        {{ inp.key_repr }}: {
+            "target_anchor": {{ inp.target_anchor_repr }},
+            "default_value": {{ inp.default_value_repr }},
+            "label": {{ inp.label_repr }},
+            "action": {{ inp.action_repr }},
+            "selector": {{ inp.selector_repr }},
+            "parameter_ref": {{ inp.parameter_ref_repr }},
         },
         {% endfor %}
     }
@@ -82,15 +82,15 @@ class {{ workflow_class_name }}:
         {% for step in action_steps %}
         {
             "step_index": {{ step.step_index }},
-            "action": "{{ step.action }}",
-            "target_anchor": "{{ step.target_anchor }}",
+            "action": {{ step.action_repr }},
+            "target_anchor": {{ step.target_anchor_repr }},
             "norm_x": {{ step.norm_x }},
             "norm_y": {{ step.norm_y }},
-            "selector": {{ step.selector | tojson if step.selector else "None" }},
-            "label": {{ step.label | tojson if step.label else "None" }},
-            "parameter_ref": {{ step.parameter_ref | tojson if step.parameter_ref else "None" }},
-            "default_value": {{ step.default_value | tojson }},
-            "description": {{ step.description | tojson }},
+            "selector": {{ step.selector_repr }},
+            "label": {{ step.label_repr }},
+            "parameter_ref": {{ step.parameter_ref_repr }},
+            "default_value": {{ step.default_value_repr }},
+            "description": {{ step.description_repr }},
         },
         {% endfor %}
     ]

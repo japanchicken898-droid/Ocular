@@ -17,6 +17,7 @@ from typing import Optional
 from rich import box
 from rich.align import Align
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -88,8 +89,8 @@ def compile_command(
         Panel(
             f"[bold cyan]Compilation Job Manifest[/bold cyan]\n"
             f"[dim]Compiling visual recording into deterministic Playwright + FastAPI service[/dim]\n"
-            f"Input Recording : [yellow]{input_path}[/yellow]\n"
-            f"Output Directory: [yellow]{out_dir}[/yellow]",
+            f"Input Recording : [yellow]{escape(str(input_path))}[/yellow]\n"
+            f"Output Directory: [yellow]{escape(str(out_dir))}[/yellow]",
             box=box.ROUNDED,
             border_style="cyan",
         )
@@ -111,7 +112,7 @@ def compile_command(
         )
         console.print(
             f"    [green]✓[/green] Ingested telemetry stream: [cyan]{len(telemetry_events)}[/cyan] events "
-            f"([yellow]{clicks_count}[/yellow] clicks as point-prompt priors) from [yellow]{telem_file}[/yellow]"
+            f"([yellow]{clicks_count}[/yellow] clicks as point-prompt priors) from [yellow]{escape(str(telem_file))}[/yellow]"
         )
 
     # Derive workflow name dynamically from session metadata, path, or explicit parameter
@@ -159,13 +160,13 @@ def compile_command(
         frames_count = len(raw_frames)
         trans_count = len(transitions)
         console.print(
-            f"    Loaded [cyan]{input_path}[/cyan] ({resolution_str}, {frames_count} frames sampled, {trans_count} key transitions)"
+            f"    Loaded [cyan]{escape(str(input_path))}[/cyan] ({resolution_str}, {frames_count} frames sampled, {trans_count} key transitions)"
         )
     except FileNotFoundError:
-        console.print(f"[bold red][!] Error:[/bold red] Input video file not found: [yellow]{input_path}[/yellow]")
+        console.print(f"[bold red][!] Error:[/bold red] Input video file not found: [yellow]{escape(str(input_path))}[/yellow]")
         return 1
     except Exception as exc:
-        console.print(f"[yellow][!] Notice:[/yellow] Ingest fallback mode enabled ({exc})")
+        console.print(f"[yellow][!] Notice:[/yellow] Ingest fallback mode enabled ({escape(str(exc))})")
         raw_frames = []
         transitions = []
 
@@ -180,7 +181,7 @@ def compile_command(
             sample_frame = raw_frames[0] if raw_frames else None
             segments = segmenter.segment(sample_frame, point_prompts=telemetry_events)
 
-        if getattr(segmenter, "last_inference_source", None) == "meta_sam_3.1_api" or os.environ.get("META_MODEL_API_KEY"):
+        if getattr(segmenter, "last_inference_source", None) == "meta_sam_3.1_api":
             console.print("    [green]✓[/green] Live Meta SAM 3.1 inference executed (POST https://api.meta.ai/v1/responses)")
         console.print(
             f"    Synthesized [cyan]{len(segments)}[/cyan] scale-invariant interactive element masks (coordinates in [0.0, 1.0])"
@@ -196,10 +197,10 @@ def compile_command(
                 output_dir=annotated_dir,
             )
             console.print(
-                f"    [green]✓[/green] Exported [cyan]{len(exported_overlays)}[/cyan] SAM 3.1 visual overlays to [yellow]{annotated_dir}[/yellow]"
+                f"    [green]✓[/green] Exported [cyan]{len(exported_overlays)}[/cyan] SAM 3.1 visual overlays to [yellow]{escape(str(annotated_dir))}[/yellow]"
             )
     except Exception as exc:
-        console.print(f"[bold red][!] Segmentation failed:[/bold red] {exc}")
+        console.print(f"[bold red][!] Segmentation failed:[/bold red] {escape(str(exc))}")
         return 1
 
     # 3. Muse Spark DAG Synthesis Stage
@@ -215,7 +216,7 @@ def compile_command(
                 dag["target_url"] = origin_url
             dag["session_dir"] = str(video_file.parent.resolve())
 
-        if getattr(builder, "last_inference_source", None) == "live_baseten_muse_spark" or os.environ.get("BASETEN_API_KEY"):
+        if getattr(builder, "last_inference_source", None) == "live_baseten_muse_spark":
             console.print("    [green]✓[/green] Live Baseten Meta Muse Spark inference executed (model: meta-models/muse-spark-open-1026)")
         console.print(
             f"    Synthesized verified DAG: [cyan]{len(dag['nodes'])}[/cyan] states, [cyan]{len(dag['edges'])}[/cyan] transitions"
@@ -224,7 +225,7 @@ def compile_command(
         dag_tree = render_rich_dag_tree(dag)
         console.print(dag_tree)
     except Exception as exc:
-        console.print(f"[bold red][!] DAG synthesis failed:[/bold red] {exc}")
+        console.print(f"[bold red][!] DAG synthesis failed:[/bold red] {escape(str(exc))}")
         return 1
 
     # 4. Muse Code Generation Stage
@@ -237,11 +238,11 @@ def compile_command(
             out_dir=output_path,
             telemetry_events=telemetry_events,
         )
-        console.print(f"    [green]✓[/green] Emitted: [yellow]{artifacts['playwright_driver'].name}[/yellow]")
-        console.print(f"    [green]✓[/green] Emitted: [yellow]{artifacts['app'].name}[/yellow]")
-        console.print(f"    [green]✓[/green] Emitted: [yellow]{artifacts['main'].name}[/yellow]")
-        console.print(f"    [green]✓[/green] Emitted: [yellow]{artifacts['state_graph'].name}[/yellow]")
-        console.print(f"    [green]✓[/green] Emitted: [yellow]{artifacts['workflow_dag_mermaid'].name}[/yellow]")
+        console.print(f"    [green]✓[/green] Emitted: [yellow]{escape(artifacts['playwright_driver'].name)}[/yellow]")
+        console.print(f"    [green]✓[/green] Emitted: [yellow]{escape(artifacts['app'].name)}[/yellow]")
+        console.print(f"    [green]✓[/green] Emitted: [yellow]{escape(artifacts['main'].name)}[/yellow]")
+        console.print(f"    [green]✓[/green] Emitted: [yellow]{escape(artifacts['state_graph'].name)}[/yellow]")
+        console.print(f"    [green]✓[/green] Emitted: [yellow]{escape(artifacts['workflow_dag_mermaid'].name)}[/yellow]")
 
         # Print extracted parameters table if parameters_schema is present
         params_schema = dag.get("parameters_schema", {})
@@ -263,21 +264,27 @@ def compile_command(
                 param_default = str(prop_meta.get("default", ""))
                 param_desc = prop_meta.get("description", "")
                 target_anchor = prop_meta.get("target_anchor") or f"#{param_name}"
-                table.add_row(param_name, param_type, param_default, target_anchor, param_desc)
+                table.add_row(
+                    escape(str(param_name)),
+                    escape(str(param_type)),
+                    escape(str(param_default)),
+                    escape(str(target_anchor)),
+                    escape(str(param_desc)),
+                )
 
             console.print(table)
     except Exception as exc:
-        console.print(f"[bold red][!] Code generation failed:[/bold red] {exc}")
+        console.print(f"[bold red][!] Code generation failed:[/bold red] {escape(str(exc))}")
         return 1
 
     duration = time.perf_counter() - t_start
-    cli_cmd = f"python {out_dir}/playwright_driver.py --headed"
+    cli_cmd = f"python {escape(str(out_dir))}/playwright_driver.py --headed"
     api_cmd = "uvicorn dist.main:app --reload"
     docs_url = "http://127.0.0.1:8000/docs"
 
     completion_content = (
         f"[bold green]✓ Compilation Successful in {duration:.2f}s[/bold green]\n\n"
-        f"[bold white]Output Directory:[/bold white] [cyan]{output_path.resolve()}[/cyan]\n\n"
+        f"[bold white]Output Directory:[/bold white] [cyan]{escape(str(output_path.resolve()))}[/cyan]\n\n"
         f"[bold cyan]▶ CLI Execution Command:[/bold cyan]\n"
         f"  [yellow]{cli_cmd}[/yellow]\n\n"
         f"[bold cyan]▶ Microservice Startup Command:[/bold cyan]\n"
@@ -310,8 +317,8 @@ def record_command(
         Panel(
             f"[bold cyan]Interactive Session Recorder Manifest[/bold cyan]\n"
             f"[dim]Capturing browser interaction stream, normalized telemetry, and canvas video[/dim]\n"
-            f"Target URL       : [yellow]{url}[/yellow]\n"
-            f"Output Directory : [yellow]{out_dir}[/yellow]\n"
+            f"Target URL       : [yellow]{escape(str(url))}[/yellow]\n"
+            f"Output Directory : [yellow]{escape(str(out_dir))}[/yellow]\n"
             f"Mode             : [green]{'Headless' if headless else 'Interactive (Headed)'}[/green]\n"
             f"Status           : [bold green]● RECORDING ACTIVE[/bold green] [dim](Interact with browser; close window to finalize)[/dim]",
             box=box.ROUNDED,
@@ -327,7 +334,7 @@ def record_command(
     try:
         result = recorder.record(url=url, duration=duration)
     except Exception as exc:
-        console.print(f"[bold red][!] Recording error:[/bold red] {exc}")
+        console.print(f"[bold red][!] Recording error:[/bold red] {escape(str(exc))}")
         return 1
 
     # Artifact Summary Table upon browser close
@@ -435,7 +442,7 @@ def execute_cli(
     print_banner(console)
     driver_script = Path(dist_dir) / "playwright_driver.py"
     if not driver_script.exists():
-        console.print(f"[bold red][!] Compiled driver not found at {driver_script}[/bold red]")
+        console.print(f"[bold red][!] Compiled driver not found at {escape(str(driver_script))}[/bold red]")
         raise typer.Exit(code=1)
 
     import subprocess

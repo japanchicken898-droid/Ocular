@@ -99,6 +99,7 @@ class DAGNode(BaseModel):
     keyframe_index: int = Field(default=0)
     url_pattern: Optional[str] = Field(default=None, description="Expected URL or route")
     segments: List[VisualSegment] = Field(default_factory=list, description="Visual segments on this screen")
+    segment_ids: List[str] = Field(default_factory=list, description="Referenced segment IDs in top-level table")
     assertions: List[str] = Field(default_factory=list, description="State invariants / assertions")
     parameter_ref: Optional[str] = Field(default=None, description="Dynamic parameter key binding (e.g. interval)")
 
@@ -123,6 +124,7 @@ class StateGraph(BaseModel):
     terminal_node_ids: List[str] = Field(default_factory=list)
     nodes: Dict[str, DAGNode] = Field(default_factory=dict)
     edges: List[DAGEdge] = Field(default_factory=list)
+    segments: Dict[str, Any] = Field(default_factory=dict, description="Normalized top-level segments lookup")
     parameters_schema: Optional[Dict[str, Any]] = Field(
         default=None, description="Synthesized parameters schema (JSON schema)"
     )

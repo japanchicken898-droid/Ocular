@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 from pathlib import Path
+import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -24,6 +25,7 @@ class OcularSessionRecorder:
 
     TELEMETRY_INIT_SCRIPT = """
     (() => {
+        if (window !== window.top) return;
         const startTime = performance.now();
         const sessionEpoch = Date.now();
 
@@ -74,6 +76,24 @@ class OcularSessionRecorder:
             }
         }, true);
 
+        function isSensitiveElement(el) {
+            if (!el) return false;
+            const tag = (el.tagName || '').toLowerCase();
+            const inputType = (el.type || '').toLowerCase();
+            if (tag === 'input' && inputType === 'password') {
+                return true;
+            }
+            const sensitiveRegex = /password|token|secret|credit_card|cvv/i;
+            const attrs = ['name', 'id', 'autocomplete', 'placeholder', 'aria-label', 'data-role'];
+            for (let i = 0; i < attrs.length; i++) {
+                const val = el.getAttribute ? el.getAttribute(attrs[i]) : null;
+                if (val && sensitiveRegex.test(val)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         window.addEventListener('keydown', (e) => {
             const vw = window.innerWidth || 1;
             const vh = window.innerHeight || 1;
@@ -84,11 +104,14 @@ class OcularSessionRecorder:
                 norm_x = (rect.left + rect.width / 2) / vw;
                 norm_y = (rect.top + rect.height / 2) / vh;
             }
+            const isSensitive = isSensitiveElement(e.target);
+            const emittedKey = isSensitive ? '[REDACTED]' : e.key;
+            const emittedCode = isSensitive ? '[REDACTED]' : e.code;
             const payload = {
                 event_type: 'keydown',
                 action_type: 'fill',
-                key: e.key,
-                code: e.code,
+                key: emittedKey,
+                code: emittedCode,
                 norm_x: Number(Math.max(0.0, Math.min(1.0, norm_x)).toFixed(4)),
                 norm_y: Number(Math.max(0.0, Math.min(1.0, norm_y)).toFixed(4)),
                 target_tag: e.target && e.target.tagName ? e.target.tagName.toLowerCase() : null,
@@ -106,6 +129,9 @@ class OcularSessionRecorder:
         }, true);
     })();
     """
+
+    MAX_TELEMETRY_EVENTS = 2500
+    MAX_STRING_ATTR_LEN = 256
 
     def __init__(
         self,
@@ -126,15 +152,47 @@ class OcularSessionRecorder:
         self.telemetry_path = self.out_dir / "telemetry_events.jsonl"
         self.video_path: Optional[Path] = None
 
+    SENSITIVE_ATTR_PATTERN = re.compile(
+        r"password|token|secret|credit_card|cvv|api_key|auth", re.IGNORECASE
+    )
+
+    def _truncate_attributes(self, event_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Truncates arbitrary string attributes and redacts sensitive inputs."""
+        cleaned = {}
+        target_str = str(event_data.get("target_selector") or "") + " " + str(event_data.get("target_tag") or "")
+        is_sensitive = bool(self.SENSITIVE_ATTR_PATTERN.search(target_str))
+
+        for k, v in event_data.items():
+            if isinstance(v, str):
+                if is_sensitive and k in ("key", "code", "value", "input_payload"):
+                    cleaned[k] = "[REDACTED]"
+                elif len(v) > self.MAX_STRING_ATTR_LEN:
+                    cleaned[k] = v[:self.MAX_STRING_ATTR_LEN]
+                else:
+                    cleaned[k] = v
+            else:
+                cleaned[k] = v
+
+        if is_sensitive and "key" in cleaned:
+            cleaned["key"] = "[REDACTED]"
+        return cleaned
+
     def push_telemetry_event(self, event_data: Dict[str, Any]) -> None:
         """Appends an event to in-memory history and streams to telemetry_events.jsonl."""
-        self.telemetry_events.append(event_data)
+        if len(self.telemetry_events) >= self.MAX_TELEMETRY_EVENTS:
+            logger.warning(
+                f"Telemetry event limit reached ({self.MAX_TELEMETRY_EVENTS}). Dropping event."
+            )
+            return
+
+        sanitized_event = self._truncate_attributes(event_data)
+        self.telemetry_events.append(sanitized_event)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         with open(self.telemetry_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(event_data) + "\n")
+            f.write(json.dumps(sanitized_event) + "\n")
         if self.on_event_callback:
             try:
-                self.on_event_callback(event_data)
+                self.on_event_callback(sanitized_event)
             except Exception as e:
                 logger.debug(f"Error in on_event_callback: {e}")
 
