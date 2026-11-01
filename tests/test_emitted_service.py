@@ -26,6 +26,11 @@ def test_emitted_fastapi_endpoints(tmp_path: Path):
 
         client = TestClient(app)
 
+        # 0. Test root redirect to /docs
+        res_root = client.get("/", follow_redirects=False)
+        assert res_root.status_code in (302, 307)
+        assert res_root.headers["location"] == "/docs"
+
         # 1. Test /health
         res_health = client.get("/health")
         assert res_health.status_code == 200

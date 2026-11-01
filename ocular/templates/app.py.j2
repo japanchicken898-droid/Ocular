@@ -12,6 +12,7 @@ import uuid
 from typing import Any, Dict, List, Optional, Union
 from fastapi import FastAPI, HTTPException, Response, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 import sys
 from pathlib import Path
@@ -82,6 +83,11 @@ class ExecuteWorkflowResponse(BaseModel):
     steps_executed: int
     results: Dict[str, Any]
     errors: Optional[List[str]] = None
+
+
+@app.get("/", include_in_schema=False)
+async def root_redirect() -> RedirectResponse:
+    return RedirectResponse(url="/docs")
 
 
 @app.get("/health", tags=["System"])

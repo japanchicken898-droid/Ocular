@@ -50,6 +50,8 @@ def test_jinja_code_generator(tmp_path: Path):
     assert '<div id="' in driver_code
 
     app_code = app_file.read_text(encoding="utf-8")
+    assert 'RedirectResponse(url="/docs")' in app_code
+    assert '@app.get("/", include_in_schema=False)' in app_code
     assert '@app.post("/api/v1/execute"' in app_code
     assert "ExecuteWorkflowRequest" in app_code
     assert "ExecuteWorkflowResponse" in app_code
