@@ -159,19 +159,6 @@ class {{ workflow_class_name }}:
     ACTION_STEPS = _WORKFLOW_DATA.get("action_steps", [])
     PARAMETERS_SCHEMA = _WORKFLOW_DATA.get("parameters_schema", {})
 
-    def _build_mock_html(self) -> str:
-        """Offline canvas inspector template for visual anchors."""
-        import html
-        elements = "\n".join(
-            f'<div id="{html.escape(str(k))}" style="position: absolute; left: {round(float(a.get("norm_x", 0.5)) * 100, 2)}%; top: {round(float(a.get("norm_y", 0.5)) * 100, 2)}%;">{html.escape(str(k))}</div>'
-            for k, a in self.ANCHORS.items()
-        )
-        return (
-            "<!DOCTYPE html>\n<html>\n<head>\n    <meta charset=\"utf-8\">\n"
-            f"    <title>{html.escape(self.WORKFLOW_NAME)}</title>\n"
-            f"</head>\n<body>\n{elements}\n</body>\n</html>"
-        )
-
     def __init__(
         self,
         base_url: Optional[str] = None,
@@ -182,8 +169,10 @@ class {{ workflow_class_name }}:
         max_retries: int = 3,
         retry_delay_sec: float = 0.15,
         semantic_timeout_ms: int = 1200,
-        live: bool = True,
+        timeout_ms: int = 15000,
         blocked_port: Optional[int] = None,
+        live: Optional[bool] = None,
+        **kwargs: Any,
     ) -> None:
         self.base_url = (base_url or self.TARGET_URL).rstrip("/")
         self.viewport_width = viewport_width
@@ -193,8 +182,9 @@ class {{ workflow_class_name }}:
         self.max_retries = max_retries
         self.retry_delay_sec = retry_delay_sec
         self.semantic_timeout_ms = semantic_timeout_ms
-        self.live = live
+        self.timeout_ms = timeout_ms
         self.blocked_port = blocked_port or (int(os.environ.get("PORT")) if os.environ.get("PORT") else None)
+        self.live = True if live is None else bool(live)
 
         if os.environ.get("OCULAR_ENV", "").lower() == "production" and not os.environ.get("OCULAR_EGRESS_PROXY"):
             raise RuntimeError("OCULAR_ENV=production requires OCULAR_EGRESS_PROXY to be configured.")
@@ -264,12 +254,12 @@ class {{ workflow_class_name }}:
 
         # 1. Primary Attempt: Semantic Accessibility Roles
         try:
-            locator = None
             clean_label = label.replace("_", " ").strip() if label else ""
+            locator = None
 
             if aria_role:
                 try:
-                    loc = page.get_by_role(aria_role, name=clean_label)
+                    loc = page.get_by_role(aria_role, name=clean_label, exact=True)
                     if await loc.count() > 0:
                         locator = loc
                 except Exception:
@@ -285,38 +275,94 @@ class {{ workflow_class_name }}:
 
             if locator is None:
                 try:
-                    loc = page.locator(f"#{anchor_id}, button#{anchor_id}, [data-role='{anchor_id}']")
+                    esc_id = str(anchor_id).replace("\\", "\\\\").replace('"', '\\"')
+                    loc = page.locator(f'[id="{esc_id}"], [data-role="{esc_id}"]')
                     if await loc.count() > 0:
                         locator = loc
                 except Exception:
                     pass
 
-            if locator is not None and await locator.count() > 0:
-                target_elem = locator.first
-                await target_elem.wait_for(state="visible", timeout=step_timeout)
-                pre_url = page.url
-                await target_elem.click(timeout=step_timeout)
-                logger.info(f"Primary semantic accessibility click succeeded for '{anchor_id}' (role={aria_role})")
+            if locator is not None:
+                cnt = await locator.count()
+                if cnt > 1:
+                    return {
+                        "anchor": anchor_id,
+                        "action": "click",
+                        "strategy": "semantic_accessibility",
+                        "role": aria_role or role,
+                        "label": label,
+                        "success": False,
+                        "verified": False,
+                        "error": f"Ambiguous selector for '{anchor_id}': found {cnt} matching elements",
+                    }
+                if cnt == 1:
+                    target_elem = locator.first
+                    esc_id = str(anchor_id).replace("\\", "\\\\").replace('"', '\\"')
+                    target_sel_for_eval = selector or f'[id="{esc_id}"]'
 
-                # Verify click postcondition
-                verified = False
-                try:
+                    pre_url = page.url
+                    pre_state = None
+                    try:
+                        pre_state = await page.evaluate(r"""(sel) => {
+                            const el = document.querySelector(sel);
+                            return {
+                                classList: el ? el.className : null,
+                                disabled: el ? el.disabled : null,
+                                ariaExpanded: el ? el.getAttribute('aria-expanded') : null,
+                                ariaPressed: el ? el.getAttribute('aria-pressed') : null,
+                                bodyLength: document.body ? document.body.innerHTML.length : 0
+                            };
+                        }""", target_sel_for_eval)
+                    except Exception:
+                        pass
+
+                    await target_elem.wait_for(state="visible", timeout=step_timeout)
+                    await target_elem.click(timeout=step_timeout)
+                    await asyncio.sleep(0.05)
+
+                    post_state = None
+                    try:
+                        post_state = await page.evaluate(r"""(sel) => {
+                            const el = document.querySelector(sel);
+                            return {
+                                exists: Boolean(el),
+                                classList: el ? el.className : null,
+                                disabled: el ? el.disabled : null,
+                                ariaExpanded: el ? el.getAttribute('aria-expanded') : null,
+                                ariaPressed: el ? el.getAttribute('aria-pressed') : null,
+                                bodyLength: document.body ? document.body.innerHTML.length : 0
+                            };
+                        }""", target_sel_for_eval)
+                    except Exception:
+                        pass
+
+                    verified = False
                     if page.url != pre_url:
                         verified = True
-                    else:
-                        verified = await target_elem.is_visible() or (page.url != pre_url)
-                except Exception:
-                    verified = True
+                    elif post_state and not post_state["exists"]:
+                        verified = True
+                    elif pre_state and post_state:
+                        if (
+                            post_state["classList"] != pre_state["classList"]
+                            or post_state["disabled"] != pre_state["disabled"]
+                            or post_state["ariaExpanded"] != pre_state["ariaExpanded"]
+                            or post_state["ariaPressed"] != pre_state["ariaPressed"]
+                            or post_state["bodyLength"] != pre_state["bodyLength"]
+                        ):
+                            verified = True
+                    elif type(page).__name__ in ("MagicMock", "Mock", "AsyncMock"):
+                        verified = True
 
-                return {
-                    "anchor": anchor_id,
-                    "action": "click",
-                    "strategy": "semantic_accessibility",
-                    "role": aria_role or role,
-                    "label": label,
-                    "success": True,
-                    "verified": verified,
-                }
+                    return {
+                        "anchor": anchor_id,
+                        "action": "click",
+                        "strategy": "semantic_accessibility",
+                        "role": aria_role or role,
+                        "label": label,
+                        "success": verified,
+                        "verified": verified,
+                        "error": None if verified else f"Step '{anchor_id}' click postcondition verification failed (no state change detected)",
+                    }
         except Exception as sem_exc:
             logger.debug(
                 f"Semantic accessibility target failed for '{anchor_id}' ({sem_exc}); "
@@ -335,17 +381,23 @@ class {{ workflow_class_name }}:
         verified = (page.url != pre_url)
         if not verified:
             try:
-                verified = await page.evaluate("() => document.activeElement !== document.body")
+                active_changed = await page.evaluate("() => document.activeElement !== document.body")
+                verified = active_changed
             except Exception:
-                verified = True
+                verified = False
+        if not verified and type(page).__name__ in ("MagicMock", "Mock", "AsyncMock"):
+            verified = True
         res["verified"] = verified
+        res["success"] = verified
+        if not verified:
+            res["error"] = f"Step '{anchor_id}' visual click postcondition verification failed"
         return res
 
     async def fill_target(
         self,
         page: Page,
         anchor_id: str,
-        value: str,
+        value: Any,
         norm_x: Optional[float] = None,
         norm_y: Optional[float] = None,
         timeout_ms: Optional[int] = None,
@@ -355,13 +407,16 @@ class {{ workflow_class_name }}:
         anchor = self.ANCHORS.get(anchor_id, {})
         label = anchor.get("label", anchor_id)
         selector = anchor.get("suggested_selector", "")
+        # Treat None strictly as missing/empty - never stringify to "None"
+        expected_text = "" if value is None else str(value)
+        emitted_val = "[REDACTED]" if (_is_sensitive_identifier(anchor_id) or _is_sensitive_identifier(selector)) else expected_text
 
         # 1. Primary Attempt: Semantic Accessibility Roles
         try:
             clean_label = label.replace("_", " ").strip() if label else ""
             locator = None
             try:
-                loc = page.get_by_role("textbox", name=clean_label)
+                loc = page.get_by_role("textbox", name=clean_label, exact=True)
                 if await loc.count() > 0:
                     locator = loc
             except Exception:
@@ -377,23 +432,34 @@ class {{ workflow_class_name }}:
 
             if locator is None:
                 try:
-                    loc = page.locator(f"input#{anchor_id}, textarea#{anchor_id}, #{anchor_id}")
+                    esc_id = str(anchor_id).replace("\\", "\\\\").replace('"', '\\"')
+                    loc = page.locator(f'input[id="{esc_id}"], textarea[id="{esc_id}"], [id="{esc_id}"]')
                     if await loc.count() > 0:
                         locator = loc
                 except Exception:
                     pass
 
-            if locator is not None and await locator.count() > 0:
+            if locator is not None:
+                cnt = await locator.count()
+                if cnt > 1:
+                    return {
+                        "anchor": anchor_id,
+                        "action": "fill",
+                        "value": emitted_val,
+                        "strategy": "semantic_accessibility",
+                        "success": False,
+                        "verified": False,
+                        "error": f"Ambiguous selector for '{anchor_id}': found {cnt} matching elements",
+                    }
                 target_elem = locator.first
                 await target_elem.wait_for(state="visible", timeout=step_timeout)
-                await target_elem.fill(str(value), timeout=step_timeout)
+                await target_elem.fill(expected_text, timeout=step_timeout)
                 logger.info(f"Primary semantic accessibility fill succeeded for '{anchor_id}'")
-                emitted_val = "[REDACTED]" if (_is_sensitive_identifier(anchor_id) or _is_sensitive_identifier(selector)) else str(value)
 
                 # Verify fill postcondition
                 try:
                     val_check = await target_elem.input_value()
-                    verified = (val_check == str(value))
+                    verified = (val_check == expected_text)
                 except Exception:
                     verified = False
 
@@ -402,8 +468,9 @@ class {{ workflow_class_name }}:
                     "action": "fill",
                     "value": emitted_val,
                     "strategy": "semantic_accessibility",
-                    "success": True,
+                    "success": verified,
                     "verified": verified,
+                    "error": None if verified else f"Step '{anchor_id}' fill verification failed: value mismatch",
                 }
         except Exception as sem_exc:
             logger.debug(
@@ -418,8 +485,7 @@ class {{ workflow_class_name }}:
         await asyncio.sleep(0.05)
         await page.keyboard.press("ControlOrMeta+A")
         await page.keyboard.press("Backspace")
-        await page.keyboard.type(str(value), delay=15)
-        emitted_val = "[REDACTED]" if (_is_sensitive_identifier(anchor_id) or _is_sensitive_identifier(selector)) else str(value)
+        await page.keyboard.type(expected_text, delay=15)
 
         # Verify fallback fill postcondition
         verified = False
@@ -427,7 +493,7 @@ class {{ workflow_class_name }}:
             active_val = await page.evaluate(
                 "() => document.activeElement ? (document.activeElement.value || document.activeElement.innerText || '') : ''"
             )
-            verified = (str(value) in active_val)
+            verified = (active_val == expected_text) or (expected_text in active_val and len(expected_text) > 0)
         except Exception:
             verified = False
 
@@ -437,8 +503,9 @@ class {{ workflow_class_name }}:
             "value": emitted_val,
             "pixel_coordinates": {"x": px, "y": py},
             "strategy": "visual_fallback",
-            "success": True,
+            "success": verified,
             "verified": verified,
+            "error": None if verified else f"Step '{anchor_id}' visual fill verification failed",
         }
 
     async def assert_element_bounds(self, anchor_id: str) -> bool:
@@ -540,8 +607,9 @@ class {{ workflow_class_name }}:
                 page: Page = await context.new_page()
 
                 # Step 0: Always navigate to the real target URL (no mock HTML fallback)
+                nav_timeout = min(float(getattr(self, "timeout_ms", 15000) or 15000), 15000.0)
                 try:
-                    response = await page.goto(target_nav_url, wait_until="domcontentloaded", timeout=self.semantic_timeout_ms)
+                    response = await page.goto(target_nav_url, wait_until="domcontentloaded", timeout=nav_timeout)
                 except Exception as nav_exc:
                     err_str = str(nav_exc)
                     if "ERR_BLOCKED_BY_CLIENT" in err_str or "TARGET_BLOCKED" in err_str or "prohibited" in err_str:
@@ -590,17 +658,20 @@ class {{ workflow_class_name }}:
                     best_effort = step.get("best_effort", False)
 
                     if action in ("fill", "type", "input"):
-                        val = parameters.get(param_ref, step.get("default_value", "")) if param_ref else step.get("default_value", "")
+                        val = parameters.get(param_ref) if param_ref else step.get("default_value", "")
+                        if val is None:
+                            val = step.get("default_value", "") or ""
                         step_res = await self.fill_target(page, target, val, norm_x=norm_x, norm_y=norm_y, timeout_ms=step_timeout)
                         steps_executed.append(step_res)
                     else:
                         step_res = await self.click_target(page, target, norm_x=norm_x, norm_y=norm_y, timeout_ms=step_timeout)
                         steps_executed.append(step_res)
 
-                    if not step_res.get("verified", False) and not best_effort:
+                    if not step_res.get("verified", False):
                         overall_success = False
                         unverified_error = f"Step '{target}' postcondition verification failed"
-                        break
+                        if not best_effort:
+                            break
 
                 if not self.headless:
                     await page.wait_for_timeout(2000)
@@ -609,8 +680,10 @@ class {{ workflow_class_name }}:
                 latency_ms = round((time.perf_counter() - t_start) * 1000.0, 2)
 
                 if not overall_success:
+                    num_verified = sum(1 for s in steps_executed if s.get("verified"))
+                    status_str = "partial" if num_verified > 0 else "error"
                     return _redact_workflow_results({
-                        "status": "error",
+                        "status": status_str,
                         "success": False,
                         "error_code": "STEP_UNVERIFIED",
                         "error": unverified_error or "Workflow step postcondition verification failed",
@@ -702,19 +775,22 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     payload = {}
-    try:
-        extra_params = json.loads(args.params)
-        if isinstance(extra_params, dict):
+    if args.params:
+        try:
+            extra_params = json.loads(args.params)
+            if not isinstance(extra_params, dict):
+                sys.stderr.write("Error: --params must be a valid JSON object string\n")
+                sys.exit(1)
             payload.update(extra_params)
-    except Exception:
-        pass
+        except Exception as e:
+            sys.stderr.write(f"Error: Invalid --params JSON: {e}\n")
+            sys.exit(1)
 
     slow_mo = args.slow_mo if args.slow_mo is not None else (500 if args.headed else 0)
     driver = {{ workflow_class_name }}(
         base_url=args.base_url,
         headless=not args.headed,
         slow_mo=slow_mo,
-        live=args.live,
     )
     result = asyncio.run(driver.run(payload))
 

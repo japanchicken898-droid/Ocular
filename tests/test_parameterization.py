@@ -39,14 +39,19 @@ class ParamFixtureHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
         elements = []
+        seen_ids = {"btn_submit", "input_query", "interval_dropdown", "timeframe_15m"}
         if self.workflow_json_path and Path(self.workflow_json_path).exists():
             try:
                 data = json.loads(Path(self.workflow_json_path).read_text(encoding="utf-8"))
                 for aid in data.get("anchors", {}):
-                    elements.append(f'<button id="{aid}" role="button">{aid}</button><input id="{aid}" role="textbox" value="" />')
+                    if aid not in seen_ids:
+                        seen_ids.add(aid)
+                        elements.append(f'<button id="{aid}" role="button" onclick="this.setAttribute(\'data-clicked\', \'1\');">{aid}</button>')
                 for step in data.get("action_steps", []):
                     t = step.get("target_anchor", "")
-                    elements.append(f'<button id="{t}" role="button">{t}</button><input id="{t}" role="textbox" value="" />')
+                    if t and t not in seen_ids:
+                        seen_ids.add(t)
+                        elements.append(f'<button id="{t}" role="button" onclick="this.setAttribute(\'data-clicked\', \'1\');">{t}</button>')
             except Exception:
                 pass
         elements_html = "\n".join(elements)
@@ -54,10 +59,10 @@ class ParamFixtureHandler(http.server.BaseHTTPRequestHandler):
 <html>
 <head><title>Parameterization Real Fixture</title></head>
 <body>
-    <button id="btn_submit" role="button">Submit</button>
+    <button id="btn_submit" role="button" onclick="this.setAttribute('data-clicked', '1');">Submit</button>
     <input id="input_query" role="textbox" name="query" value="" />
-    <button id="interval_dropdown" role="button">Interval</button>
-    <button id="timeframe_15m" role="button">15m</button>
+    <button id="interval_dropdown" role="button" onclick="this.setAttribute('data-clicked', '1');">Interval</button>
+    <button id="timeframe_15m" role="button" onclick="this.setAttribute('data-clicked', '1');">15m</button>
     {elements_html}
 </body>
 </html>"""
@@ -84,9 +89,11 @@ def compiled_test_dist(tmp_path_factory, param_fixture_server: str):
     old_egress = os.environ.get("OCULAR_ALLOWED_EGRESS_HOSTS")
     old_auth = os.environ.get("OCULAR_INSECURE_NO_AUTH")
 
+    app_host_port = param_fixture_server.replace("http://", "").rstrip("/")
     os.environ["OCULAR_INSECURE_NO_AUTH"] = "1"
-    os.environ["OCULAR_ALLOWED_HOSTS"] = "127.0.0.1"
-    os.environ["OCULAR_ALLOWED_EGRESS_HOSTS"] = "127.0.0.1"
+    os.environ["OCULAR_ALLOWED_HOSTS"] = app_host_port
+    os.environ["OCULAR_ALLOWED_EGRESS_HOSTS"] = app_host_port
+    os.environ["OCULAR_ENABLE_DOCS"] = "1"
     tmp_path = tmp_path_factory.mktemp("param_test")
     video_path = tmp_path / "sample.mp4"
     generate_synthetic_screen_recording(video_path, fps=30, width=1920, height=1080)
@@ -103,6 +110,7 @@ def compiled_test_dist(tmp_path_factory, param_fixture_server: str):
     ParamFixtureHandler.workflow_json_path = dist_dir / "workflow.json"
     yield dist_dir
 
+    os.environ.pop("OCULAR_ENABLE_DOCS", None)
     if old_hosts is not None:
         os.environ["OCULAR_ALLOWED_HOSTS"] = old_hosts
     else:

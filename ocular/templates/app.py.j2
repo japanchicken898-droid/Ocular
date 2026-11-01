@@ -21,8 +21,9 @@ from urllib.parse import urlparse
 import uuid
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from typing import Any, Dict, List, Optional, Union, Type
 from pydantic import BaseModel, Field, ValidationError, create_model, ConfigDict
 import secrets
@@ -100,10 +101,15 @@ async def validate_safe_url(url: str, allow_local: Optional[bool] = None) -> str
 MAX_CONCURRENT_RUNS = int(os.environ.get("OCULAR_MAX_CONCURRENT_RUNS", "5"))
 _execution_semaphore = asyncio.Semaphore(MAX_CONCURRENT_RUNS)
 
+ENABLE_DOCS = os.environ.get("OCULAR_ENABLE_DOCS") == "1"
+
 app = FastAPI(
     title="Ocular Automation Service - {{ workflow_class_name }}",
     description="Offline-compiled automation service with zero runtime vision inference.",
     version="1.0.0",
+    docs_url="/docs" if ENABLE_DOCS else None,
+    redoc_url="/redoc" if ENABLE_DOCS else None,
+    openapi_url="/openapi.json" if ENABLE_DOCS else None,
 )
 
 # Authentication dependency
@@ -118,7 +124,21 @@ def verify_api_key(request: Request) -> None:
             detail="Authentication required: OCULAR_API_KEY is not configured.",
         )
     provided_key = request.headers.get("X-API-Key", "")
-    if not provided_key or not secrets.compare_digest(provided_key, expected_key):
+    if not provided_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing X-API-Key header.",
+        )
+    try:
+        provided_key.encode("ascii")
+    except UnicodeEncodeError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing X-API-Key header.",
+        )
+    provided_bytes = provided_key.encode("utf-8", "surrogateescape")
+    expected_bytes = expected_key.encode("utf-8", "surrogateescape")
+    if not secrets.compare_digest(provided_bytes, expected_bytes):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing X-API-Key header.",
@@ -133,6 +153,9 @@ if _allowed_origins_env:
 else:
     allowed_origins = []
     allow_credentials = False
+
+if allow_credentials and ("*" in allowed_origins):
+    raise RuntimeError("CORS misconfiguration: allow_origins=['*'] cannot be used when allow_credentials=True")
 
 app.add_middleware(
     CORSMiddleware,
@@ -150,14 +173,22 @@ MAX_REQUEST_BODY_BYTES = int(os.environ.get("OCULAR_MAX_BODY_SIZE_BYTES", str(2 
 async def limit_request_body_size(request: Request, call_next):
     """Enforces request payload size limits against DoS payload attacks, supporting chunked streaming."""
     if request.method == "POST" and request.url.path.endswith("/api/v1/execute"):
+        # Verify API key before buffering body to prevent unauthenticated DoS
+        try:
+            verify_api_key(request)
+        except HTTPException as auth_exc:
+            return JSONResponse(
+                status_code=auth_exc.status_code,
+                content={"detail": auth_exc.detail},
+            )
+
         content_length = request.headers.get("content-length")
         if content_length:
             try:
                 if int(content_length) > MAX_REQUEST_BODY_BYTES:
-                    return Response(
-                        content=json.dumps({"detail": f"Request body exceeds maximum permitted size of {MAX_REQUEST_BODY_BYTES} bytes."}),
+                    return JSONResponse(
                         status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                        media_type="application/json",
+                        content={"detail": f"Request body exceeds maximum permitted size of {MAX_REQUEST_BODY_BYTES} bytes."},
                     )
             except ValueError:
                 pass
@@ -167,10 +198,9 @@ async def limit_request_body_size(request: Request, call_next):
         async for chunk in request.stream():
             total_bytes += len(chunk)
             if total_bytes > MAX_REQUEST_BODY_BYTES:
-                return Response(
-                    content=json.dumps({"detail": f"Request body exceeds maximum permitted size of {MAX_REQUEST_BODY_BYTES} bytes."}),
+                return JSONResponse(
                     status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                    media_type="application/json",
+                    content={"detail": f"Request body exceeds maximum permitted size of {MAX_REQUEST_BODY_BYTES} bytes."},
                 )
             body_chunks.append(chunk)
 
@@ -183,6 +213,32 @@ async def limit_request_body_size(request: Request, call_next):
         request._receive = receive
 
     return await call_next(request)
+
+
+def _clean_validation_errors(errors: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    cleaned = []
+    for err in errors:
+        c = dict(err)
+        c.pop("input", None)
+        c.pop("ctx", None)
+        cleaned.append(c)
+    return cleaned
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": _clean_validation_errors(exc.errors())},
+    )
+
+
+@app.exception_handler(ValidationError)
+async def pydantic_validation_exception_handler(request: Request, exc: ValidationError):
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": _clean_validation_errors(exc.errors())},
+    )
 
 
 try:
@@ -244,6 +300,7 @@ RESERVED_FIELD_NAMES = {
 def _build_execution_payload_model() -> Type[BaseModel]:
     schema = WORKFLOW_DATA.get("parameters_schema", {}) or {}
     props = schema.get("properties", {})
+    required_fields = set(schema.get("required", []))
     field_defs = {
         "viewport_width": (int, Field(default=1280, ge=200, le=3840, description="Browser viewport width in pixels")),
         "viewport_height": (int, Field(default=720, ge=200, le=2160, description="Browser viewport height in pixels")),
@@ -254,19 +311,23 @@ def _build_execution_payload_model() -> Type[BaseModel]:
     for p_name, p_meta in props.items():
         p_type_str = p_meta.get("type", "string")
         py_t = type_map.get(p_type_str, str)
-        def_val = None if _is_sensitive_identifier(p_name) else p_meta.get("default", None)
 
         field_name = f"param_{p_name}" if (p_name in RESERVED_FIELD_NAMES or p_name.startswith("_")) else p_name
         alias_name = p_name if field_name != p_name else None
 
         if field_name not in field_defs:
             field_kwargs = {
-                "default": def_val,
                 "description": p_meta.get("description", ""),
             }
             if alias_name:
                 field_kwargs["alias"] = alias_name
-            field_defs[field_name] = (Optional[py_t], Field(**field_kwargs))
+
+            if p_name in required_fields:
+                field_defs[field_name] = (py_t, Field(..., **field_kwargs))
+            else:
+                def_val = None if _is_sensitive_identifier(p_name) else p_meta.get("default", None)
+                field_kwargs["default"] = def_val
+                field_defs[field_name] = (Optional[py_t], Field(**field_kwargs))
 
     return create_model("ExecutionPayload", **field_defs, __config__=ConfigDict(extra="forbid", populate_by_name=True))
 
@@ -303,18 +364,15 @@ class ExecuteWorkflowResponse(BaseModel):
 
 
 @app.get("/", include_in_schema=False)
-async def root_redirect() -> RedirectResponse:
-    return RedirectResponse(url="/docs")
+async def root_redirect() -> Response:
+    if os.environ.get("OCULAR_ENABLE_DOCS") == "1":
+        return RedirectResponse(url="/docs")
+    return Response(status_code=status.HTTP_404_NOT_FOUND)
 
 
 @app.get("/health", tags=["System"])
-async def health() -> Dict[str, Any]:
-    return {
-        "status": "ok",
-        "compiler": "Ocular",
-        "compile_hash": COMPILE_HASH,
-        "workflow": WORKFLOW_NAME,
-    }
+async def health() -> Dict[str, str]:
+    return {"status": "ok"}
 
 
 @app.get("/api/v1/schema", tags=["System"], dependencies=[Depends(verify_api_key)])
@@ -382,7 +440,7 @@ async def execute_workflow(
         except ValidationError as val_exc:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=val_exc.errors(),
+                detail=_clean_validation_errors(val_exc.errors()),
             )
     elif isinstance(payload, ExecutionPayload):
         typed_payload = payload
@@ -397,7 +455,7 @@ async def execute_workflow(
         except ValidationError as val_exc:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=val_exc.errors(),
+                detail=_clean_validation_errors(val_exc.errors()),
             )
 
     queue_timeout_sec = float(os.environ.get("OCULAR_QUEUE_TIMEOUT_SEC", "5.0"))
@@ -484,4 +542,4 @@ async def execute_workflow(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=False)

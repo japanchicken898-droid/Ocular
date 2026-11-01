@@ -19,15 +19,20 @@ class RealFixtureHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
         elements = []
+        seen_ids = {"btn_submit", "input_query", "interval_dropdown", "timeframe_15m"}
         if self.workflow_json_path and Path(self.workflow_json_path).exists():
             import json
             try:
                 data = json.loads(Path(self.workflow_json_path).read_text(encoding="utf-8"))
                 for aid in data.get("anchors", {}):
-                    elements.append(f'<button id="{aid}" role="button">{aid}</button><input id="{aid}" role="textbox" value="" />')
+                    if aid not in seen_ids:
+                        seen_ids.add(aid)
+                        elements.append(f'<button id="{aid}" role="button" onclick="this.setAttribute(\'data-clicked\', \'1\');">{aid}</button>')
                 for step in data.get("action_steps", []):
                     t = step.get("target_anchor", "")
-                    elements.append(f'<button id="{t}" role="button">{t}</button><input id="{t}" role="textbox" value="" />')
+                    if t and t not in seen_ids:
+                        seen_ids.add(t)
+                        elements.append(f'<button id="{t}" role="button" onclick="this.setAttribute(\'data-clicked\', \'1\');">{t}</button>')
             except Exception:
                 pass
         elements_html = "\n".join(elements)
@@ -35,10 +40,10 @@ class RealFixtureHandler(http.server.BaseHTTPRequestHandler):
 <html>
 <head><title>Ocular Real Fixture</title></head>
 <body>
-    <button id="btn_submit" role="button">Submit</button>
+    <button id="btn_submit" role="button" onclick="this.setAttribute('data-clicked', '1');">Submit</button>
     <input id="input_query" role="textbox" name="query" value="" />
-    <button id="interval_dropdown" role="button">Interval</button>
-    <button id="timeframe_15m" role="button">15m</button>
+    <button id="interval_dropdown" role="button" onclick="this.setAttribute('data-clicked', '1');">Interval</button>
+    <button id="timeframe_15m" role="button" onclick="this.setAttribute('data-clicked', '1');">15m</button>
     {elements_html}
 </body>
 </html>"""
@@ -82,17 +87,15 @@ def test_emitted_fastapi_endpoints(tmp_path: Path, local_app_server: str, monkey
 
         client = TestClient(app)
 
-        # 0. Test root redirect to /docs
+        # 0. Test root when docs are disabled by default (D-04)
         res_root = client.get("/", follow_redirects=False)
-        assert res_root.status_code in (302, 307)
-        assert res_root.headers["location"] == "/docs"
+        assert res_root.status_code == 404
 
-        # 1. Test /health
+        # 1. Test /health (D-03: strictly {"status": "ok"})
         res_health = client.get("/health")
         assert res_health.status_code == 200
         health_data = res_health.json()
-        assert health_data["status"] == "ok"
-        assert health_data["compiler"] == "Ocular"
+        assert health_data == {"status": "ok"}
 
         # 2. Test /api/v1/schema
         res_schema = client.get("/api/v1/schema")

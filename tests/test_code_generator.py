@@ -48,7 +48,8 @@ def test_jinja_code_generator(tmp_path: Path):
     assert "click_with_retry" in driver_code
     assert "execute_workflow" in driver_code
     assert "--headed" in driver_code
-    assert '<div id="' in driver_code
+    # E-04: Mock HTML is eliminated (no fabricated success)
+    assert "_build_mock_html" not in driver_code
 
     app_code = app_file.read_text(encoding="utf-8")
     assert 'RedirectResponse(url="/docs")' in app_code

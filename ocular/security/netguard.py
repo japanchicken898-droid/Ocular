@@ -665,8 +665,21 @@ async def setup_confinement_routes(
 
             await route.abort("blockedbyclient")
         except Exception as exc:
-            logger.debug(f"Error in _http_route_guard: {exc}; aborting route.")
-            await route.abort("blockedbyclient")
+            err_msg = str(exc).lower()
+            if "econnrefused" in err_msg or "connection refused" in err_msg:
+                abort_code = "connectionrefused"
+            elif "econnreset" in err_msg or "connection reset" in err_msg:
+                abort_code = "connectionreset"
+            elif "timed out" in err_msg or "timeout" in err_msg or "etimedout" in err_msg:
+                abort_code = "timedout"
+            elif "enotfound" in err_msg or "name not resolved" in err_msg:
+                abort_code = "namenotresolved"
+            elif "blockedbyclient" in err_msg or "prohibited" in err_msg:
+                abort_code = "blockedbyclient"
+            else:
+                abort_code = "connectionfailed"
+            logger.debug(f"Error in _http_route_guard: {exc}; aborting route with {abort_code}.")
+            await route.abort(abort_code)
 
     async def _ws_route_guard(ws_route: Any) -> None:
         try:

@@ -589,17 +589,22 @@ class JinjaCodeGenerator(BaseGenerator):
         has_parameterized_inputs = len(input_fields) > 0
         if has_parameterized_inputs:
             properties = {}
+            required_keys = []
             for inp in input_fields:
-                properties[inp["key"]] = {
+                k = inp["key"]
+                properties[k] = {
                     "type": "string",
                     "default": inp["default_value"],
-                    "description": inp.get("label", f"{inp['key']} parameter"),
+                    "description": inp.get("label", f"{k} parameter"),
                 }
+                if inp.get("required") or not inp.get("default_value"):
+                    required_keys.append(k)
+
             parameters_schema = {
                 "title": f"{workflow_class_name}ExecutionRequest",
                 "type": "object",
                 "properties": properties,
-                "required": list(properties.keys()),
+                "required": required_keys,
             }
         else:
             # Generic execution options schema

@@ -17,6 +17,9 @@ logger = logging.getLogger("ocular.telemetry")
 MAX_NUMERIC_VALUE = 1e15
 MAX_ELAPSED_MS = 86_400_000  # 24 hours in milliseconds
 MAX_LINE_LENGTH = 65_536  # 64 KB per line cap
+MAX_EVENT_SIZE = 4_096   # 4 KB per serialized event cap
+MAX_CUMULATIVE_BYTES = 50 * 1024 * 1024  # 50 MB total file budget
+DISCARD_CHUNK_SIZE = 16_384  # 16 KB chunks for discarding oversized lines
 
 
 def coerce_telemetry_event(event: Any) -> Optional[Dict[str, Any]]:
@@ -103,20 +106,48 @@ def load_telemetry_events(
 
     events: List[Dict[str, Any]] = []
     dropped_count = 0
+    total_bytes_read = 0
 
     try:
         with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                if len(events) >= max_events:
+            while len(events) < max_events:
+                if total_bytes_read >= MAX_CUMULATIVE_BYTES:
+                    logger.warning(
+                        f"Telemetry file {file_path.name} exceeded cumulative byte budget ({MAX_CUMULATIVE_BYTES} bytes)."
+                    )
                     break
 
-                # Cap line length at 64 KB
-                if len(line) > MAX_LINE_LENGTH:
-                    dropped_count += 1
+                chunk = f.readline(MAX_LINE_LENGTH + 1)
+                if not chunk:
+                    break
+
+                chunk_len = len(chunk)
+                total_bytes_read += chunk_len
+
+                # If chunk length exceeds MAX_LINE_LENGTH, or line was cut off without newline before EOF
+                if chunk_len > MAX_LINE_LENGTH or (not chunk.endswith("\n") and not chunk.endswith("\r")):
+                    # Check if at EOF: if reading 1 more char gives EOF, then chunk is the last line
+                    next_char = f.readline(1)
+                    if next_char:
+                        total_bytes_read += 1
+                        # It's an oversized line! Discard the rest of the line in bounded chunks without buffering
+                        while True:
+                            discard = f.readline(DISCARD_CHUNK_SIZE)
+                            if not discard:
+                                break
+                            total_bytes_read += len(discard)
+                            if discard.endswith("\n") or discard.endswith("\r"):
+                                break
+                        dropped_count += 1
+                        continue
+
+                stripped = chunk.strip()
+                if not stripped:
                     continue
 
-                stripped = line.strip()
-                if not stripped:
+                # Enforce per-event serialized size cap (4 KB)
+                if len(stripped.encode("utf-8")) > MAX_EVENT_SIZE:
+                    dropped_count += 1
                     continue
 
                 try:

@@ -27,7 +27,7 @@ class FixtureServerHandler(BaseHTTPRequestHandler):
 <html>
 <head><title>Test App</title></head>
 <body>
-    <button id="btn_submit" role="button">Submit</button>
+    <button id="btn_submit" role="button" onclick="this.setAttribute('data-clicked', '1');">Submit</button>
     <input id="input_query" role="textbox" name="query" value="" />
 </body>
 </html>"""
