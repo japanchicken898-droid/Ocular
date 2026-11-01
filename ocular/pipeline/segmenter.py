@@ -15,6 +15,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 import urllib.parse
 import urllib.request
@@ -168,12 +169,12 @@ def apply_point_prompt_priors(
             ay = max(0.0, min(1.0 - anchor_h, cy - anchor_h / 2.0))
 
             clean_id = (
-                target_selector.lstrip("#.").replace(".", "_").replace("-", "_").replace("[", "_").replace("]", "").replace("=", "_").replace('"', "")
+                re.sub(r"[^A-Za-z0-9_-]+", "_", target_selector).strip("_")[:64]
                 if target_selector
                 else f"sam_anchor_click_{idx}"
             )
             if not clean_id or clean_id[0].isdigit():
-                clean_id = f"anchor_{clean_id}"
+                clean_id = f"anchor_{clean_id}"[:64]
 
             results.append(
                 {

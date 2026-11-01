@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 from enum import Enum
+import math
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+ID_REGEX = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 class SegmentRole(str, Enum):
@@ -21,6 +25,8 @@ class SegmentRole(str, Enum):
     CHECKBOX = "checkbox"
     HEADER = "header"
     FORM = "form"
+    CANVAS = "canvas"
+    ELEMENT = "element"
 
 
 class ActionType(str, Enum):
@@ -40,6 +46,19 @@ class BoundingBox(BaseModel):
     width: float = Field(..., description="Width")
     height: float = Field(..., description="Height")
 
+    @field_validator("x", "y", "width", "height", mode="before")
+    @classmethod
+    def validate_finite_float(cls, v: Any) -> float:
+        if v is None:
+            raise ValueError("Coordinate cannot be None")
+        try:
+            val = float(v)
+        except (ValueError, TypeError):
+            raise ValueError(f"Coordinate must be a finite float, got {v!r}")
+        if not math.isfinite(val):
+            raise ValueError(f"Coordinate must be finite, got {v!r}")
+        return val
+
     @property
     def center_x(self) -> float:
         return self.x + self.width / 2.0
@@ -58,16 +77,35 @@ class BoundingBox(BaseModel):
 
 
 class VisualSegment(BaseModel):
-    id: str = Field(..., description="Unique ID for segment (e.g. seg_login_btn)")
-    label: str = Field(..., description="Visual text or human-readable description")
+    id: str = Field(..., max_length=64, description="Unique ID for segment (e.g. seg_login_btn)")
+    label: str = Field(default="", max_length=512, description="Visual text or human-readable description")
     role: SegmentRole = Field(default=SegmentRole.CONTAINER, description="Inferred UI role")
     bbox: BoundingBox = Field(..., description="Bounding box on screen")
     confidence: float = Field(default=1.0, ge=0.0, le=1.0, description="SAM / vision model confidence")
     suggested_selector: Optional[str] = Field(
         default=None,
+        max_length=512,
         description="Emitted Playwright CSS/Text/Role selector deduced from visual/text cues"
     )
     attributes: Dict[str, Any] = Field(default_factory=dict, description="Additional DOM/visual metadata")
+
+    @field_validator("role", mode="before")
+    @classmethod
+    def coerce_role(cls, v: Any) -> SegmentRole:
+        if isinstance(v, SegmentRole):
+            return v
+        val_str = str(v).lower()
+        try:
+            return SegmentRole(val_str)
+        except ValueError:
+            return SegmentRole.CONTAINER
+
+    @field_validator("id")
+    @classmethod
+    def validate_id_format(cls, v: str) -> str:
+        if not ID_REGEX.match(v):
+            raise ValueError(f"Segment id '{v}' does not match pattern ^[A-Za-z0-9_-]{{1,64}}$")
+        return v
 
 
 class FrameMetadata(BaseModel):
@@ -93,34 +131,55 @@ class TransitionEvent(BaseModel):
 
 
 class DAGNode(BaseModel):
-    id: str = Field(..., description="State identifier, e.g. state_login_page")
-    title: str = Field(..., description="Descriptive state title")
-    screen_name: str = Field(..., description="Unique screen identifier")
+    id: str = Field(..., max_length=64, description="State identifier, e.g. state_login_page")
+    title: str = Field(..., max_length=512, description="Descriptive state title")
+    screen_name: str = Field(default="screen_main", max_length=512, description="Unique screen identifier")
     keyframe_index: int = Field(default=0)
-    url_pattern: Optional[str] = Field(default=None, description="Expected URL or route")
+    url_pattern: Optional[str] = Field(default=None, max_length=512, description="Expected URL or route")
     segments: List[VisualSegment] = Field(default_factory=list, description="Visual segments on this screen")
     segment_ids: List[str] = Field(default_factory=list, description="Referenced segment IDs in top-level table")
     assertions: List[str] = Field(default_factory=list, description="State invariants / assertions")
-    parameter_ref: Optional[str] = Field(default=None, description="Dynamic parameter key binding (e.g. interval)")
+    parameter_ref: Optional[str] = Field(default=None, max_length=512, description="Dynamic parameter key binding (e.g. interval)")
+
+    @field_validator("id")
+    @classmethod
+    def validate_id_format(cls, v: str) -> str:
+        if not ID_REGEX.match(v):
+            raise ValueError(f"DAGNode id '{v}' does not match pattern ^[A-Za-z0-9_-]{{1,64}}$")
+        return v
 
 
 class DAGEdge(BaseModel):
-    from_node_id: str
-    to_node_id: str
+    from_node_id: str = Field(..., max_length=64)
+    to_node_id: str = Field(..., max_length=64)
     action_type: ActionType
-    target_segment_id: Optional[str] = None
-    target_selector: str = Field(..., description="Playwright selector to trigger transition")
-    target_label: Optional[str] = None
-    input_payload: Optional[str] = None
-    parameter_ref: Optional[str] = Field(default=None, description="Dynamic parameter key binding")
-    wait_condition: Optional[str] = Field(default=None, description="Wait selector or network idle")
-    timeout_ms: int = Field(default=5000)
-    description: Optional[str] = None
+    target_segment_id: Optional[str] = Field(default=None, max_length=64)
+    target_selector: str = Field(..., max_length=512, description="Playwright selector to trigger transition")
+    target_label: Optional[str] = Field(default=None, max_length=512)
+    input_payload: Optional[str] = Field(default=None, max_length=512)
+    parameter_ref: Optional[str] = Field(default=None, max_length=512, description="Dynamic parameter key binding")
+    wait_condition: Optional[str] = Field(default=None, max_length=512, description="Wait selector or network idle")
+    timeout_ms: int = Field(default=5000, ge=100, le=120000)
+    description: Optional[str] = Field(default=None, max_length=512)
+
+    @field_validator("from_node_id", "to_node_id")
+    @classmethod
+    def validate_edge_nodes(cls, v: str) -> str:
+        if not ID_REGEX.match(v):
+            raise ValueError(f"DAGEdge node id '{v}' does not match pattern ^[A-Za-z0-9_-]{{1,64}}$")
+        return v
+
+    @field_validator("target_segment_id")
+    @classmethod
+    def validate_target_segment_id(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not ID_REGEX.match(v):
+            raise ValueError(f"DAGEdge target_segment_id '{v}' does not match pattern ^[A-Za-z0-9_-]{{1,64}}$")
+        return v
 
 
 class StateGraph(BaseModel):
-    name: str = Field(default="OcularAutomatedWorkflow")
-    initial_node_id: str
+    name: str = Field(default="OcularAutomatedWorkflow", max_length=128)
+    initial_node_id: str = Field(..., max_length=64)
     terminal_node_ids: List[str] = Field(default_factory=list)
     nodes: Dict[str, DAGNode] = Field(default_factory=dict)
     edges: List[DAGEdge] = Field(default_factory=list)
@@ -128,6 +187,13 @@ class StateGraph(BaseModel):
     parameters_schema: Optional[Dict[str, Any]] = Field(
         default=None, description="Synthesized parameters schema (JSON schema)"
     )
+
+    @field_validator("initial_node_id")
+    @classmethod
+    def validate_initial_node_id(cls, v: str) -> str:
+        if not ID_REGEX.match(v):
+            raise ValueError(f"initial_node_id '{v}' does not match pattern ^[A-Za-z0-9_-]{{1,64}}$")
+        return v
 
     def get_linear_path(self) -> List[DAGEdge]:
         """Returns the primary execution path for code generation."""

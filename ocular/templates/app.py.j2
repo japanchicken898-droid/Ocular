@@ -12,6 +12,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import sys
 import time
@@ -22,7 +23,8 @@ import uuid
 from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
-from pydantic import BaseModel, Field, ValidationError
+from typing import Any, Dict, List, Optional, Union, Type
+from pydantic import BaseModel, Field, ValidationError, create_model, ConfigDict
 
 _BASE_DIR = Path(__file__).resolve().parent
 if str(_BASE_DIR) not in sys.path:
@@ -31,7 +33,7 @@ if str(_BASE_DIR) not in sys.path:
 from playwright_driver import {{ workflow_class_name }}, OcularPlaywrightDriver
 
 COMPILE_HASH = "{{ compile_hash }}"
-WORKFLOW_NAME = "{{ dag.workflow_name }}"
+WORKFLOW_NAME = getattr({{ workflow_class_name }}, "WORKFLOW_NAME", "OcularWorkflow")
 
 # SSRF Protection: Block access to loopback, link-local, and private subnets
 BLOCKED_IP_NETWORKS = [
@@ -299,28 +301,44 @@ async def limit_request_body_size(request: Request, call_next):
     return await call_next(request)
 
 
-class ExecutionPayload(BaseModel):
-    """Dynamically synthesized parameter payload model from DAG parameters_schema."""
-    {% if has_parameterized_inputs and parameters_schema and parameters_schema.properties %}
-    {% for prop_name, prop_meta in parameters_schema.properties.items() %}
-    {% set py_type = "int" if prop_meta.type == "integer" else ("bool" if prop_meta.type == "boolean" else ("float" if prop_meta.type == "number" else "str")) %}
-    {{ prop_name }}: {{ py_type }} = Field(
-        default={{ prop_meta.default | tojson if prop_meta.default is defined else ("0" if prop_meta.type == "integer" else "''") }},
-        description={{ prop_meta.description | tojson if prop_meta.description is defined else "''" }}
-    )
-    {% endfor %}
-    {% else %}
-    viewport_width: int = Field(default=1280, description="Browser viewport width in pixels")
-    viewport_height: int = Field(default=720, description="Browser viewport height in pixels")
-    headless: bool = Field(default=True, description="Whether to run browser in headless mode")
-    timeout_ms: int = Field(default=10000, description="Execution timeout in milliseconds")
-    {% endif %}
+def _is_sensitive_identifier(val: Any) -> bool:
+    if not val:
+        return False
+    text = str(val).lower()
+    if 'type="password"' in text or "type='password'" in text:
+        return True
+    pattern = r"(?:^|[^a-z0-9])(password|passwd|pwd|pass|passcode|passphrase|secret|token|jwt|bearer|session|cookie|otp|2fa|mfa|pin|ssn|cvv|cvc|csc|cardnumber|iban|routing|api[_\s-]?key|private[_\s-]?key|secret[_\s-]?key|access[_\s-]?key|auth[_\s-]?key|one[_\s-]?time(?:[_\s-]?code)?|cc[_\s-]?number|card[_\s-]?number|credit[_\s-]?card)(?:$|[^a-z0-9])"
+    return bool(re.search(pattern, text, re.IGNORECASE))
+
+
+def _build_execution_payload_model() -> Type[BaseModel]:
+    schema = getattr({{ workflow_class_name }}, "PARAMETERS_SCHEMA", {}) or {}
+    props = schema.get("properties", {})
+    field_defs = {
+        "viewport_width": (int, Field(default=1280, description="Browser viewport width in pixels")),
+        "viewport_height": (int, Field(default=720, description="Browser viewport height in pixels")),
+        "headless": (bool, Field(default=True, description="Whether to run browser in headless mode")),
+        "timeout_ms": (int, Field(default=10000, description="Execution timeout in milliseconds")),
+    }
+    type_map = {"integer": int, "number": float, "boolean": bool, "string": str}
+    for p_name, p_meta in props.items():
+        if p_name not in field_defs:
+            p_type_str = p_meta.get("type", "string")
+            py_t = type_map.get(p_type_str, str)
+            def_val = None if _is_sensitive_identifier(p_name) else p_meta.get("default", None)
+            field_defs[p_name] = (Optional[py_t], Field(default=def_val, description=p_meta.get("description", "")))
+    return create_model("ExecutionPayload", **field_defs, __config__=ConfigDict(extra="allow"))
+
+
+ExecutionPayload = _build_execution_payload_model()
 
 
 class ExecuteWorkflowRequest(BaseModel):
-    workflow_name: Optional[str] = Field(default=WORKFLOW_NAME, description="Target workflow name")
+    model_config = ConfigDict(extra="allow")
+
+    workflow_name: Optional[str] = Field(default=None, description="Target workflow name")
     parameters: Optional[Dict[str, Any]] = Field(
-        default_factory=lambda: ExecutionPayload().model_dump(),
+        default=None,
         description="Dynamic execution parameters"
     )
     base_url: Optional[str] = Field(default=None, description="Application root URL override")
@@ -360,12 +378,32 @@ async def health() -> Dict[str, Any]:
 @app.get("/api/v1/schema", tags=["System"])
 async def get_parameters_schema() -> Dict[str, Any]:
     """Returns the parameterized dynamic inputs schema and visual anchors registry."""
+    schema_dict = ExecutionPayload.model_json_schema()
+    props = schema_dict.get("properties", {})
+    for p_name, p_def in props.items():
+        if _is_sensitive_identifier(p_name):
+            p_def.pop("default", None)
+            p_def["description"] = f"Credential parameter {p_name}"
+
+    clean_inputs = []
+    raw_inputs = getattr({{ workflow_class_name }}, "INPUT_FIELDS", [])
+    if isinstance(raw_inputs, dict):
+        raw_inputs = list(raw_inputs.values())
+    for inp in raw_inputs:
+        inp_copy = dict(inp)
+        k = inp_copy.get("key", "")
+        sel = inp_copy.get("selector", "")
+        lbl = inp_copy.get("label", "")
+        if _is_sensitive_identifier(k) or _is_sensitive_identifier(sel) or _is_sensitive_identifier(lbl):
+            inp_copy["default_value"] = ""
+        clean_inputs.append(inp_copy)
+
     return {
         "workflow": WORKFLOW_NAME,
         "compile_hash": COMPILE_HASH,
-        "parameters_schema": ExecutionPayload.model_json_schema(),
-        "input_parameters": {{ workflow_class_name }}.INPUT_FIELDS,
-        "anchors_count": len({{ workflow_class_name }}.ANCHORS),
+        "parameters_schema": schema_dict,
+        "input_parameters": clean_inputs,
+        "anchors_count": len(getattr({{ workflow_class_name }}, "ANCHORS", {})),
         "zero_runtime_vision": True,
     }
 
@@ -393,9 +431,11 @@ async def execute_workflow(
             req_base_url = await validate_safe_url(payload.base_url)
         req_headless = payload.headless
         req_live = payload.live
-        raw_params = payload.parameters if payload.parameters is not None else {}
+        raw_params = dict(payload.parameters) if payload.parameters is not None else {}
+        extra_fields = payload.model_extra or {}
+        combined_params = {**extra_fields, **raw_params}
         try:
-            typed_payload = ExecutionPayload(**raw_params)
+            typed_payload = ExecutionPayload(**combined_params)
         except ValidationError as val_exc:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,

@@ -2,25 +2,115 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import keyword
 import logging
 from pathlib import Path
 import re
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 from jinja2 import Environment, FileSystemLoader
+from pydantic import ValidationError
 
-from ocular.models.types import CompiledArtifacts, StateGraph
+from ocular.models.types import (
+    CompiledArtifacts,
+    StateGraph,
+    VisualSegment,
+    DAGEdge,
+    DAGNode,
+    ID_REGEX,
+)
 from ocular.pipeline.base import BaseGenerator
+from ocular.pipeline.state_graph import CompilationError
 
 logger = logging.getLogger("ocular.pipeline.code_generator")
 
 
-SECRET_PATTERN = re.compile(
-    r"password|token|secret|credit_card|cvv|one-time-code|otp|pin|ssn|auth_key|api_key|auth|bearer", re.IGNORECASE
-)
+def validate_compilation_inputs(dag: Any, segments: Any) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Strictly validates compilation dag and segments using Pydantic models.
+
+    Raises CompilationError if validation fails or inputs contain non-dict / invalid elements.
+    """
+    if not isinstance(dag, dict):
+        raise CompilationError(f"DAG must be a dictionary, got {type(dag).__name__}")
+    if not isinstance(segments, list):
+        raise CompilationError(f"Segments must be a list, got {type(segments).__name__}")
+
+    # Validate each segment is a dict and satisfies VisualSegment
+    for idx, seg in enumerate(segments):
+        if not isinstance(seg, dict):
+            raise CompilationError(f"Segment at index {idx} must be a dictionary, got {type(seg).__name__}")
+        seg_norm = dict(seg)
+        if "label" not in seg_norm or not seg_norm["label"]:
+            seg_norm["label"] = str(seg_norm.get("id", ""))
+        try:
+            VisualSegment.model_validate(seg_norm)
+        except (ValidationError, ValueError) as val_err:
+            raise CompilationError(f"Invalid segment at index {idx}: {val_err}") from val_err
+
+    # Validate root_node and initial_node_id if present
+    for node_key in ("root_node", "initial_node_id"):
+        if node_key in dag and dag[node_key]:
+            val = str(dag[node_key])
+            if not ID_REGEX.match(val):
+                raise CompilationError(f"Invalid {node_key} '{val}': does not match ^[A-Za-z0-9_-]{{1,64}}$")
+
+    # Validate edges
+    edges = dag.get("edges", [])
+    if not isinstance(edges, list):
+        raise CompilationError(f"DAG edges must be a list, got {type(edges).__name__}")
+
+    for idx, edge in enumerate(edges):
+        if not isinstance(edge, dict):
+            raise CompilationError(f"Edge at index {idx} must be a dictionary, got {type(edge).__name__}")
+        edge_norm = dict(edge)
+        raw_action = edge_norm.get("action_type") or edge_norm.get("action") or "click"
+        if hasattr(raw_action, "value"):
+            action = str(raw_action.value).lower()
+        else:
+            action = str(raw_action).lower()
+            if "." in action:
+                action = action.split(".")[-1]
+        edge_norm["action_type"] = action
+        if "from_node" in edge_norm and "from_node_id" not in edge_norm:
+            edge_norm["from_node_id"] = edge_norm["from_node"]
+        elif "from_state" in edge_norm and "from_node_id" not in edge_norm:
+            edge_norm["from_node_id"] = edge_norm["from_state"]
+        if "to_node" in edge_norm and "to_node_id" not in edge_norm:
+            edge_norm["to_node_id"] = edge_norm["to_node"]
+        elif "to_state" in edge_norm and "to_node_id" not in edge_norm:
+            edge_norm["to_node_id"] = edge_norm["to_state"]
+        if "target_selector" not in edge_norm or not edge_norm["target_selector"]:
+            target_id = edge_norm.get("target_segment_id") or edge_norm.get("trigger_element") or "element"
+            edge_norm["target_selector"] = f"#{target_id}"
+        try:
+            DAGEdge.model_validate(edge_norm)
+        except (ValidationError, ValueError) as val_err:
+            raise CompilationError(f"Invalid edge at index {idx}: {val_err}") from val_err
+
+    # Validate nodes
+    nodes = dag.get("nodes", {})
+    if not isinstance(nodes, dict):
+        raise CompilationError(f"DAG nodes must be a dictionary, got {type(nodes).__name__}")
+    for nid, node in nodes.items():
+        if not isinstance(node, dict):
+            raise CompilationError(f"DAG node '{nid}' must be a dictionary, got {type(node).__name__}")
+        node_norm = dict(node)
+        if "id" not in node_norm or not node_norm["id"]:
+            node_norm["id"] = nid
+        if "title" not in node_norm or not node_norm["title"]:
+            node_norm["title"] = str(node_norm.get("label") or nid)
+        try:
+            DAGNode.model_validate(node_norm)
+        except (ValidationError, ValueError) as val_err:
+            raise CompilationError(f"Invalid node '{nid}': {val_err}") from val_err
+
+    return dag, segments
+
+
+from ocular.security.redaction import EXPLICIT_PARAMETER_ALLOWLIST, is_sensitive_field, redact_event
 
 
 def _sanitize_param_key(name: str) -> str:
@@ -29,7 +119,7 @@ def _sanitize_param_key(name: str) -> str:
         cleaned = f"param_{cleaned}"
     if keyword.iskeyword(cleaned):
         cleaned = f"{cleaned}_"
-    return cleaned
+    return cleaned[:64]
 
 
 def sanitize_workflow_class_name(name: Optional[str]) -> str:
@@ -131,16 +221,9 @@ def extract_telemetry_input_parameters(telemetry_events: Optional[List[Dict[str,
             target = ev.get("target_selector") or ev.get("target_tag") or "text_input"
             by_target.setdefault(target, []).append(ev)
 
+    seen_keys: Set[str] = set()
     for target, ev_list in by_target.items():
-        chars = []
-        for e in ev_list:
-            k = e.get("key") or e.get("value") or e.get("input_payload") or ""
-            if len(k) == 1:
-                chars.append(k)
-            elif k and k not in ("Enter", "Tab", "Shift", "Control", "Alt", "Meta", "Escape"):
-                chars.append(k)
-
-        default_val = "".join(chars) if chars else "sample_input"
+        # NEVER derive parameter key from typed characters or payload!
         target_name = target
         if "#" in target_name:
             target_name = target_name.split("#")[-1]
@@ -148,20 +231,40 @@ def extract_telemetry_input_parameters(telemetry_events: Optional[List[Dict[str,
             target_name = target_name.split(".")[-1]
         target_name = target_name.split("[")[0].strip()
         clean_name = re.sub(r"[^a-zA-Z0-9_]+", "_", target_name).strip("_")
-        key = _sanitize_param_key(clean_name or "input_text")
+        base_key = _sanitize_param_key(clean_name or "input_text")
 
-        is_sensitive = bool(
-            SECRET_PATTERN.search(key)
-            or SECRET_PATTERN.search(target)
-            or "[REDACTED]" in default_val
-        )
-        if is_sensitive:
+        key = base_key
+        suffix = 2
+        while key in seen_keys:
+            key = f"{base_key[:60]}_{suffix}"
+            suffix += 1
+        seen_keys.add(key)
+
+        is_sensitive = is_sensitive_field({"key": key, "name": key, "selector": target, "target_selector": target})
+        if not is_sensitive:
+            for e in ev_list:
+                if is_sensitive_field(e):
+                    is_sensitive = True
+                    break
+
+        # Default-deny for typed text:
+        # Sensitive fields or unknown sensitivity not in explicit allowlist get NO default value
+        if is_sensitive or key not in EXPLICIT_PARAMETER_ALLOWLIST:
             default_val = ""
+        else:
+            chars = []
+            for e in ev_list:
+                k = e.get("key") or e.get("value") or ""
+                if len(k) == 1:
+                    chars.append(k)
+                elif k and k not in ("Enter", "Tab", "Shift", "Control", "Alt", "Meta", "Escape"):
+                    chars.append(k)
+            default_val = "".join(chars) if chars else "sample_input"
 
         inputs.append({
             "key": key,
             "parameter_ref": key,
-            "target_anchor": clean_name,
+            "target_anchor": clean_name or key,
             "default_value": default_val,
             "label": f"Input value for {target}" if not is_sensitive else f"Credential parameter {key}",
             "action": "fill",
@@ -292,31 +395,44 @@ class JinjaCodeGenerator(BaseGenerator):
             action = str(e.get("action_type") or e.get("action", "")).lower()
             if action in ("fill", "type") or e.get("input_payload"):
                 target_id = e.get("trigger_element") or e.get("target_segment_id") or "field"
-                raw_key = e.get("input_payload") or e.get("parameter_ref") or target_id
-                key = _sanitize_param_key(raw_key)
-                if key not in seen_keys:
-                    seen_keys.add(key)
-                    default_val = e.get("default_value", e.get("input_payload", "sample_input"))
-                    is_sensitive = bool(
-                        SECRET_PATTERN.search(key)
-                        or SECRET_PATTERN.search(str(target_id))
-                        or SECRET_PATTERN.search(str(raw_key))
-                        or "[REDACTED]" in str(default_val)
-                    )
-                    if is_sensitive:
-                        default_val = ""
+                # NEVER derive parameter key from input_payload
+                raw_key = e.get("parameter_ref") or target_id
+                base_key = _sanitize_param_key(raw_key)
+                key = base_key
+                suffix = 2
+                while key in seen_keys:
+                    key = f"{base_key[:60]}_{suffix}"
+                    suffix += 1
 
-                    inputs.append(
-                        {
-                            "key": key,
-                            "parameter_ref": key,
-                            "target_anchor": target_id,
-                            "default_value": default_val,
-                            "label": e.get("target_label", key) if not is_sensitive else f"Credential parameter {key}",
-                            "action": "fill",
-                            "selector": e.get("target_selector"),
-                        }
-                    )
+                seen_keys.add(key)
+                is_sensitive = is_sensitive_field({
+                    "key": key,
+                    "name": key,
+                    "target": target_id,
+                    "target_selector": e.get("target_selector"),
+                    "selector": e.get("target_selector"),
+                })
+                if is_sensitive:
+                    default_val = ""
+                    e["input_payload"] = "[REDACTED]"
+                    e["default_value"] = ""
+                elif key in EXPLICIT_PARAMETER_ALLOWLIST:
+                    default_val = e.get("default_value", "sample_input")
+                else:
+                    default_val = ""
+                    e["default_value"] = ""
+
+                inputs.append(
+                    {
+                        "key": key,
+                        "parameter_ref": key,
+                        "target_anchor": target_id,
+                        "default_value": default_val,
+                        "label": e.get("target_label", key) if not is_sensitive else f"Credential parameter {key}",
+                        "action": "fill",
+                        "selector": e.get("target_selector"),
+                    }
+                )
 
         return inputs
 
@@ -345,7 +461,23 @@ class JinjaCodeGenerator(BaseGenerator):
                 norm_y = bbox.get("y", 0.5) + bbox.get("height", 0.0) / 2.0
 
             param_ref = e.get("parameter_ref")
-            default_val = e.get("input_payload") or e.get("default_value") or ""
+            target_selector = e.get("target_selector") or seg.get("suggested_selector")
+            is_sensitive = is_sensitive_field({
+                "target": target_id,
+                "selector": target_selector,
+                "parameter_ref": param_ref,
+                "label": e.get("target_label"),
+            })
+
+            if is_sensitive:
+                default_val = ""
+                e["input_payload"] = "[REDACTED]"
+                e["default_value"] = ""
+            elif param_ref and param_ref in EXPLICIT_PARAMETER_ALLOWLIST:
+                default_val = e.get("default_value") or ""
+            else:
+                default_val = ""
+                e["default_value"] = ""
 
             steps.append({
                 "step_index": idx + 1,
@@ -353,7 +485,7 @@ class JinjaCodeGenerator(BaseGenerator):
                 "target_anchor": target_id,
                 "norm_x": round(float(norm_x), 4),
                 "norm_y": round(float(norm_y), 4),
-                "selector": e.get("target_selector") or seg.get("suggested_selector"),
+                "selector": target_selector,
                 "label": e.get("target_label") or seg.get("label", target_id),
                 "parameter_ref": param_ref,
                 "default_value": default_val,
@@ -393,6 +525,14 @@ class JinjaCodeGenerator(BaseGenerator):
         telemetry_events: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Path]:
         """Renders playwright_driver.py, app.py, and main.py into out_dir."""
+        # 1. Strictly validate compilation inputs before processing
+        validate_compilation_inputs(dag, segments)
+
+        # 2. Deep copy inputs so caller's objects are never mutated
+        dag = copy.deepcopy(dag)
+        segments = copy.deepcopy(segments)
+        telemetry_events = copy.deepcopy(telemetry_events) if telemetry_events else None
+
         out_path = Path(out_dir)
         out_path.mkdir(parents=True, exist_ok=True)
 
@@ -401,10 +541,6 @@ class JinjaCodeGenerator(BaseGenerator):
         workflow_class_name = derive_workflow_name_from_url(raw_name)
         workflow_class_name = sanitize_workflow_class_name(workflow_class_name)
         dag["workflow_name"] = workflow_class_name
-
-        compile_hash = self._compute_hash(dag, segments)
-        compile_hash_repr = json.dumps(compile_hash)
-        workflow_name_repr = json.dumps(workflow_class_name)
 
         # Extract dynamic inputs and generic action steps
         input_fields = self._extract_dynamic_inputs(dag, segments, telemetry_events=telemetry_events)
@@ -463,67 +599,90 @@ class JinjaCodeGenerator(BaseGenerator):
 
         target_url = extract_origin_url(dag, telemetry_events=telemetry_events, out_dir=out_path)
         dag["target_url"] = target_url
-        target_url_repr = json.dumps(target_url)
-
-        # Pre-serialize string attributes in segments, anchors, inputs, and action steps
-        for seg in segments:
-            seg["id_repr"] = json.dumps(str(seg.get("id", "")))
-            seg["label_repr"] = json.dumps(str(seg.get("label", seg.get("id", ""))))
-            seg["role_repr"] = json.dumps(str(seg.get("role", "element")))
-            seg["suggested_selector_repr"] = json.dumps(str(seg.get("suggested_selector") or ""))
 
         anchors = {}
         for seg in segments:
             bbox = seg.get("bbox", {})
-            norm_x = bbox.get("x", 0.0) + bbox.get("width", 0.0) / 2.0
-            norm_y = bbox.get("y", 0.0) + bbox.get("height", 0.0) / 2.0
+            norm_x = float(bbox.get("x", 0.0) + bbox.get("width", 0.0) / 2.0)
+            norm_y = float(bbox.get("y", 0.0) + bbox.get("height", 0.0) / 2.0)
             anchors[seg.get("id")] = {
                 "id": seg.get("id"),
-                "id_repr": seg["id_repr"],
                 "label": seg.get("label", seg.get("id")),
-                "label_repr": seg["label_repr"],
                 "role": seg.get("role", "element"),
-                "role_repr": seg["role_repr"],
-                "norm_x": round(float(norm_x), 4),
-                "norm_y": round(float(norm_y), 4),
-                "bbox": bbox,
+                "norm_x": round(norm_x, 4),
+                "norm_y": round(norm_y, 4),
+                "bbox": {
+                    "x": float(bbox.get("x", 0.0)),
+                    "y": float(bbox.get("y", 0.0)),
+                    "width": float(bbox.get("width", 0.0)),
+                    "height": float(bbox.get("height", 0.0)),
+                },
                 "suggested_selector": seg.get("suggested_selector"),
-                "suggested_selector_repr": seg["suggested_selector_repr"],
             }
 
-        for inp in input_fields:
-            inp["key_repr"] = json.dumps(str(inp.get("key") or ""))
-            inp["target_anchor_repr"] = json.dumps(str(inp.get("target_anchor") or ""))
-            inp["default_value_repr"] = json.dumps(str(inp.get("default_value") if inp.get("default_value") is not None else ""))
-            inp["label_repr"] = json.dumps(str(inp.get("label") or ""))
-            inp["action_repr"] = json.dumps(str(inp.get("action") or "fill"))
-            inp["selector_repr"] = json.dumps(str(inp.get("selector") or ""))
-            inp["parameter_ref_repr"] = json.dumps(str(inp.get("parameter_ref") or ""))
+        input_fields_dict = {
+            inp["key"]: {
+                "key": inp.get("key"),
+                "target_anchor": inp.get("target_anchor", ""),
+                "default_value": inp.get("default_value", ""),
+                "label": inp.get("label", ""),
+                "action": inp.get("action", "fill"),
+                "selector": inp.get("selector", ""),
+                "parameter_ref": inp.get("parameter_ref", inp["key"]),
+            }
+            for inp in input_fields
+        }
 
+        cleaned_steps = []
         for step in action_steps:
-            step["action_repr"] = json.dumps(str(step.get("action") or "click"))
-            step["target_anchor_repr"] = json.dumps(str(step.get("target_anchor") or ""))
-            step["selector_repr"] = json.dumps(str(step.get("selector"))) if step.get("selector") is not None else "None"
-            step["label_repr"] = json.dumps(str(step.get("label"))) if step.get("label") is not None else "None"
-            step["parameter_ref_repr"] = json.dumps(str(step.get("parameter_ref"))) if step.get("parameter_ref") is not None else "None"
-            step["default_value_repr"] = json.dumps(str(step.get("default_value") if step.get("default_value") is not None else ""))
-            step["description_repr"] = json.dumps(str(step.get("description") or ""))
+            cleaned_steps.append({
+                "step_index": step.get("step_index", 0),
+                "action": step.get("action", "click"),
+                "target_anchor": step.get("target_anchor", ""),
+                "norm_x": float(step.get("norm_x", 0.5)),
+                "norm_y": float(step.get("norm_y", 0.5)),
+                "selector": step.get("selector"),
+                "label": step.get("label"),
+                "parameter_ref": step.get("parameter_ref"),
+                "default_value": step.get("default_value", ""),
+                "description": step.get("description", ""),
+                "timeout_ms": step.get("timeout_ms"),
+            })
 
-        context = {
-            "dag": dag,
-            "workflow_class_name": workflow_class_name,
-            "workflow_name_repr": workflow_name_repr,
+        # Deterministic compile hash based on normalized workflow payload
+        hash_payload = {
+            "workflow_name": workflow_class_name,
             "target_url": target_url,
-            "target_url_repr": target_url_repr,
-            "segments": segments,
             "anchors": anchors,
+            "input_fields": input_fields_dict,
+            "action_steps": cleaned_steps,
+            "parameters_schema": parameters_schema,
+        }
+        compile_hash = hashlib.sha256(
+            json.dumps(hash_payload, sort_keys=True, allow_nan=False).encode("utf-8")
+        ).hexdigest()[:16]
+
+        # Save workflow.json (primary source of truth loaded by driver)
+        workflow_json_data = {
+            "workflow_name": workflow_class_name,
+            "workflow_class_name": workflow_class_name,
+            "target_url": target_url,
             "compile_hash": compile_hash,
-            "compile_hash_repr": compile_hash_repr,
-            "input_fields": input_fields,
-            "input_keys": input_keys,
-            "action_steps": action_steps,
+            "anchors": anchors,
+            "input_fields": input_fields_dict,
+            "action_steps": cleaned_steps,
             "parameters_schema": parameters_schema,
             "has_parameterized_inputs": has_parameterized_inputs,
+        }
+        workflow_json_file = out_path / "workflow.json"
+        self._safe_write_text(
+            workflow_json_file,
+            json.dumps(workflow_json_data, indent=2, allow_nan=False),
+        )
+
+        context = {
+            "workflow_class_name": workflow_class_name,
+            "compile_hash": compile_hash,
         }
 
         # 1. Render playwright_driver.py
@@ -533,15 +692,17 @@ class JinjaCodeGenerator(BaseGenerator):
         self._safe_write_text(driver_file, driver_code)
 
         # 2. Render app.py (FastAPI microservice with /api/v1/execute)
-        tmpl_name = "app.py.j2" if (self.templates_dir / "app.py.j2").exists() else "fastapi_app.py.j2"
-        app_tmpl = self.env.get_template(tmpl_name)
+        app_tmpl = self.env.get_template("app.py.j2")
         app_code = app_tmpl.render(context)
         app_file = out_path / "app.py"
         self._safe_write_text(app_file, app_code)
 
-        # 3. Write main.py
+        # 3. Write main.py (3-line entrypoint shim)
         main_file = out_path / "main.py"
-        self._safe_write_text(main_file, app_code)
+        self._safe_write_text(
+            main_file,
+            '"""Ocular application entrypoint shim."""\nfrom app import app\n\n__all__ = ["app"]\n',
+        )
 
         # 4. Save state_graph.json
         state_graph_file = out_path / "state_graph.json"
@@ -552,11 +713,12 @@ class JinjaCodeGenerator(BaseGenerator):
                     "dag": dag,
                     "workflow_class_name": workflow_class_name,
                     "compile_hash": compile_hash,
-                    "action_steps": action_steps,
+                    "action_steps": cleaned_steps,
                     "input_fields": input_fields,
                     "parameters_schema": parameters_schema,
                 },
                 indent=2,
+                allow_nan=False,
             ),
         )
 
@@ -571,6 +733,7 @@ class JinjaCodeGenerator(BaseGenerator):
             "main": main_file.resolve(),
             "state_graph": state_graph_file.resolve(),
             "workflow_dag_mermaid": mermaid_file.resolve(),
+            "workflow_json": workflow_json_file.resolve(),
         }
 
     def generate(

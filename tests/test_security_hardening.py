@@ -34,6 +34,7 @@ def test_workflow_name_sanitization_alphabetic_prefix():
 
 
 def test_code_generation_injection_resilience(tmp_path: Path):
+    from ocular.pipeline.state_graph import CompilationError
     generator = JinjaCodeGenerator()
     malicious_segments = [
         {
@@ -52,7 +53,21 @@ def test_code_generation_injection_resilience(tmp_path: Path):
     }
 
     out_dir = tmp_path / "hardened_dist"
-    artifacts = generator.emit(dag=dag, segments=malicious_segments, out_dir=out_dir)
+    # Malicious segment IDs violating ^[A-Za-z0-9_-]{1,64}$ must be rejected by CompilationError
+    with pytest.raises(CompilationError):
+        generator.emit(dag=dag, segments=malicious_segments, out_dir=out_dir)
+
+    # Tricky labels, selectors, and URLs with a valid ID emit safely via workflow.json
+    safe_segments = [
+        {
+            "id": "btn_safe",
+            "label": 'Click me \n""" multi-line exploit """',
+            "role": "button",
+            "bbox": {"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4},
+            "suggested_selector": 'div[data-hack="true\']"; drop_db(); #',
+        }
+    ]
+    artifacts = generator.emit(dag=dag, segments=safe_segments, out_dir=out_dir)
 
     driver_code = artifacts["playwright_driver"].read_text(encoding="utf-8")
     app_code = artifacts["app"].read_text(encoding="utf-8")
@@ -501,9 +516,9 @@ def test_driver_respects_step_timeout(tmp_path: Path):
     out_dir = tmp_path / "timeout_dist"
     artifacts = generator.emit(dag=dag, segments=segments, out_dir=out_dir)
 
-    driver_code = artifacts["playwright_driver"].read_text(encoding="utf-8")
-    assert '"timeout_ms": 4500' in driver_code
-    assert '"timeout_ms": 3200' in driver_code
+    wf_json = (out_dir / "workflow.json").read_text(encoding="utf-8")
+    assert '"timeout_ms": 4500' in wf_json
+    assert '"timeout_ms": 3200' in wf_json
 
     # Verify runtime driver instance has ACTION_STEPS with timeout_ms
     import sys

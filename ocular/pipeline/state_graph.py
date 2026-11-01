@@ -19,15 +19,13 @@ import urllib.request
 import networkx as nx
 from rich.tree import Tree
 
-SECRET_PATTERN = re.compile(
-    r"password|token|secret|credit_card|cvv|api_key|auth|bearer", re.IGNORECASE
-)
+from ocular.security.redaction import EXPLICIT_PARAMETER_ALLOWLIST, is_sensitive_field
 
 def _sanitize_param_key(name: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", str(name).strip())
     if not cleaned or cleaned[0].isdigit():
         cleaned = f"param_{cleaned}"
-    return cleaned
+    return cleaned[:64]
 
 try:
     from openai import OpenAI
@@ -92,28 +90,46 @@ class DAGBuilder(BaseSynthesizer):
         for e in edges:
             action = str(e.get("action_type") or e.get("action", "")).lower()
             if action in ("fill", "type") or e.get("input_payload"):
-                trigger = e.get("trigger_element") or "input"
-                raw_key = e.get("input_payload") or trigger
-                key = _sanitize_param_key(raw_key)
-                default_val = e.get("default_value", "sample_input")
+                trigger = e.get("trigger_element") or e.get("target_segment_id") or "input"
+                # NEVER derive a parameter key from input_payload/typed values
+                raw_key = e.get("parameter_ref") or trigger
+                base_key = _sanitize_param_key(raw_key)
 
-                # Redact sensitive parameters so secrets never leak into openapi.json/schemas
-                is_sensitive = bool(
-                    SECRET_PATTERN.search(key)
-                    or SECRET_PATTERN.search(str(trigger))
-                    or SECRET_PATTERN.search(str(raw_key))
-                    or "[REDACTED]" in str(default_val)
-                )
+                # De-duplicate with numeric suffixes without dropping fields
+                key = base_key
+                suffix = 2
+                while key in properties and e.get("parameter_ref") != key:
+                    key = f"{base_key[:60]}_{suffix}"
+                    suffix += 1
+
+                is_sensitive = is_sensitive_field({
+                    "key": key,
+                    "name": key,
+                    "trigger": trigger,
+                    "target_selector": e.get("target_selector"),
+                    "selector": e.get("target_selector"),
+                })
+
+                # Default-deny for typed text:
+                # Sensitive fields or fields of unknown sensitivity not in explicit allowlist get NO default value
                 if is_sensitive:
+                    default_val = ""
+                    e["input_payload"] = "[REDACTED]"
+                    e["default_value"] = ""
+                    e["value"] = "[REDACTED]"
+                elif key in EXPLICIT_PARAMETER_ALLOWLIST:
+                    default_val = e.get("default_value", "sample_input")
+                else:
                     default_val = ""
                     e["default_value"] = ""
 
                 if key not in properties:
-                    properties[key] = {
+                    prop_meta: Dict[str, Any] = {
                         "type": "string",
                         "default": default_val,
                         "description": f"Input value for {trigger}" if not is_sensitive else f"Credential parameter {key}",
                     }
+                    properties[key] = prop_meta
                     required.append(key)
                 e["parameter_ref"] = key
 

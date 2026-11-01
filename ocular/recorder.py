@@ -12,10 +12,13 @@ import json
 import logging
 from pathlib import Path
 import re
+import secrets
 import time
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
+
+from ocular.security.redaction import is_sensitive_field, redact_event
 
 logger = logging.getLogger("ocular.recorder")
 
@@ -23,11 +26,12 @@ logger = logging.getLogger("ocular.recorder")
 class OcularSessionRecorder:
     """Records an interactive browser session with video and telemetry events."""
 
-    TELEMETRY_INIT_SCRIPT = """
+    _INIT_SCRIPT_TEMPLATE = r"""
     (() => {
         if (window !== window.top) return;
         const startTime = performance.now();
         const sessionEpoch = Date.now();
+        const SESSION_NONCE = "__SESSION_NONCE__";
 
         function getElapsedMs() {
             return Math.round(performance.now() - startTime);
@@ -36,7 +40,7 @@ class OcularSessionRecorder:
         function getElementSelector(el) {
             if (!el || el === document.body || el === document.documentElement) return null;
             if (el.id) return '#' + el.id;
-            let selector = el.tagName.toLowerCase();
+            let selector = (el.tagName || '').toLowerCase();
             if (el.className && typeof el.className === 'string') {
                 const classes = el.className.trim().split(/\\s+/).slice(0, 2).filter(Boolean);
                 if (classes.length > 0) {
@@ -49,7 +53,51 @@ class OcularSessionRecorder:
             return selector;
         }
 
+        function checkSensitiveString(str) {
+            if (!str || typeof str !== 'string') return false;
+            if (str.toLowerCase().indexOf('type="password"') !== -1 || str.toLowerCase().indexOf("type='password'") !== -1) return true;
+            const sensitiveRegex = /(?:^|[^a-zA-Z0-9])(password|passwd|pwd|pass|passcode|passphrase|secret|token|jwt|bearer|session|cookie|otp|2fa|mfa|pin|ssn|cvv|cvc|csc|cardnumber|iban|routing|auth_key|auth-key|credit_card|credit-card|api_key|api-key|private_key|private-key|secret_key|secret-key|access_key|access-key|one-time-code|one_time_code|one-time|cc-number|cc_number|card_number|card-number)(?:$|[^a-zA-Z0-9])/i;
+            return sensitiveRegex.test(str);
+        }
+
+        function isSensitiveElement(el) {
+            if (!el) return false;
+            let curr = el;
+            while (curr && curr !== document && curr !== window) {
+                const tag = (curr.tagName || '').toLowerCase();
+                const inputType = (curr.type || '').toLowerCase();
+                if (tag === 'input' && inputType === 'password') {
+                    return true;
+                }
+                const isContentEditable = Boolean(curr.isContentEditable || (curr.getAttribute && (curr.getAttribute('contenteditable') === 'true' || curr.getAttribute('contenteditable') === '')));
+                const isRoleTextbox = Boolean(curr.getAttribute && curr.getAttribute('role') === 'textbox');
+                const isTextarea = tag === 'textarea';
+
+                const ac = (curr.getAttribute ? curr.getAttribute('autocomplete') || '' : '').toLowerCase();
+                if (ac && (ac.indexOf('password') !== -1 || ac.indexOf('one-time-code') !== -1 || ac.indexOf('cc-') !== -1)) {
+                    return true;
+                }
+
+                if (isTextarea || isContentEditable || isRoleTextbox) {
+                    if (checkSensitiveString(curr.id) || checkSensitiveString(curr.className) || (curr.getAttribute && checkSensitiveString(curr.getAttribute('placeholder')))) {
+                        return true;
+                    }
+                }
+                const attrs = ['name', 'id', 'autocomplete', 'placeholder', 'aria-label', 'data-role', 'type', 'aria-description'];
+                for (let i = 0; i < attrs.length; i++) {
+                    const val = curr.getAttribute ? curr.getAttribute(attrs[i]) : null;
+                    if (val && checkSensitiveString(val)) {
+                        return true;
+                    }
+                }
+                curr = curr.parentElement || (curr.getRootNode && curr.getRootNode().host);
+            }
+            return false;
+        }
+
         window.addEventListener('mousedown', (e) => {
+            if (e.isTrusted === false) return;
+            const target = (e.composedPath && e.composedPath().length > 0) ? e.composedPath()[0] : e.target;
             const vw = window.innerWidth || 1;
             const vh = window.innerHeight || 1;
             const norm_x = Math.max(0.0, Math.min(1.0, e.clientX / vw));
@@ -62,10 +110,11 @@ class OcularSessionRecorder:
                 client_x: e.clientX,
                 client_y: e.clientY,
                 button: e.button,
-                target_tag: e.target && e.target.tagName ? e.target.tagName.toLowerCase() : null,
-                target_selector: getElementSelector(e.target),
+                target_tag: target && target.tagName ? target.tagName.toLowerCase() : null,
+                target_selector: getElementSelector(target),
                 elapsed_ms: getElapsedMs(),
                 timestamp_ms: sessionEpoch + getElapsedMs(),
+                _nonce: SESSION_NONCE,
             };
             try {
                 if (window.__ocular_push_telemetry) {
@@ -76,43 +125,19 @@ class OcularSessionRecorder:
             }
         }, true);
 
-        function isSensitiveElement(el) {
-            if (!el) return false;
-            const tag = (el.tagName || '').toLowerCase();
-            const inputType = (el.type || '').toLowerCase();
-            if (tag === 'input' && inputType === 'password') {
-                return true;
-            }
-            const isContentEditable = Boolean(el.isContentEditable || (el.getAttribute && (el.getAttribute('contenteditable') === 'true' || el.getAttribute('contenteditable') === '')));
-            const isTextarea = tag === 'textarea';
-            const sensitiveRegex = /password|token|secret|credit_card|credit-card|cvv|one-time-code|one_time_code|otp|pin|ssn|auth_key|auth-key/i;
-
-            if (isTextarea || isContentEditable) {
-                if (sensitiveRegex.test(el.id || '') || sensitiveRegex.test(el.className || '') || sensitiveRegex.test(el.getAttribute ? el.getAttribute('placeholder') || '' : '')) {
-                    return true;
-                }
-            }
-            const attrs = ['name', 'id', 'autocomplete', 'placeholder', 'aria-label', 'data-role', 'type', 'aria-description'];
-            for (let i = 0; i < attrs.length; i++) {
-                const val = el.getAttribute ? el.getAttribute(attrs[i]) : null;
-                if (val && sensitiveRegex.test(val)) {
-                    return true;
-                }
-            }
-            return false;
-        }
-
         window.addEventListener('keydown', (e) => {
+            if (e.isTrusted === false) return;
+            const target = (e.composedPath && e.composedPath().length > 0) ? e.composedPath()[0] : e.target;
             const vw = window.innerWidth || 1;
             const vh = window.innerHeight || 1;
             let norm_x = 0.5;
             let norm_y = 0.5;
-            if (e.target && e.target.getBoundingClientRect) {
-                const rect = e.target.getBoundingClientRect();
+            if (target && target.getBoundingClientRect) {
+                const rect = target.getBoundingClientRect();
                 norm_x = (rect.left + rect.width / 2) / vw;
                 norm_y = (rect.top + rect.height / 2) / vh;
             }
-            const isSensitive = isSensitiveElement(e.target);
+            const isSensitive = isSensitiveElement(target);
             const emittedKey = isSensitive ? '[REDACTED]' : e.key;
             const emittedCode = isSensitive ? '[REDACTED]' : e.code;
             const payload = {
@@ -122,10 +147,11 @@ class OcularSessionRecorder:
                 code: emittedCode,
                 norm_x: Number(Math.max(0.0, Math.min(1.0, norm_x)).toFixed(4)),
                 norm_y: Number(Math.max(0.0, Math.min(1.0, norm_y)).toFixed(4)),
-                target_tag: e.target && e.target.tagName ? e.target.tagName.toLowerCase() : null,
-                target_selector: getElementSelector(e.target),
+                target_tag: target && target.tagName ? target.tagName.toLowerCase() : null,
+                target_selector: getElementSelector(target),
                 elapsed_ms: getElapsedMs(),
                 timestamp_ms: sessionEpoch + getElapsedMs(),
+                _nonce: SESSION_NONCE,
             };
             try {
                 if (window.__ocular_push_telemetry) {
@@ -138,8 +164,48 @@ class OcularSessionRecorder:
     })();
     """
 
+    TELEMETRY_INIT_SCRIPT = _INIT_SCRIPT_TEMPLATE.replace("__SESSION_NONCE__", "default_nonce")
+
+    @property
+    def init_script(self) -> str:
+        return self.get_init_script()
+
+    def __getattribute__(self, name: str) -> Any:
+        if name == "TELEMETRY_INIT_SCRIPT":
+            try:
+                nonce = object.__getattribute__(self, "session_nonce")
+                template = object.__getattribute__(self, "_INIT_SCRIPT_TEMPLATE")
+                return template.replace("__SESSION_NONCE__", nonce)
+            except AttributeError:
+                pass
+        return super().__getattribute__(name)
+
     MAX_TELEMETRY_EVENTS = 2500
     MAX_STRING_ATTR_LEN = 256
+    MAX_EVENT_BYTES = 4096
+
+    ALLOWED_EVENT_TYPES = {"mousedown", "keydown", "click", "fill", "input", "keypress", "navigation"}
+    ALLOWED_ACTION_TYPES = {"click", "fill", "type", "navigate", "wait"}
+    ALLOWED_EVENT_KEYS = {
+        "event_type",
+        "action_type",
+        "key",
+        "code",
+        "value",
+        "input_payload",
+        "default_value",
+        "norm_x",
+        "norm_y",
+        "client_x",
+        "client_y",
+        "button",
+        "target_tag",
+        "target_selector",
+        "elapsed_ms",
+        "timestamp_ms",
+        "_nonce",
+    }
+    STRING_FIELDS = {"key", "code", "value", "input_payload", "target_tag", "target_selector"}
 
     def __init__(
         self,
@@ -156,33 +222,37 @@ class OcularSessionRecorder:
         self.headless = headless
         self.slow_mo = slow_mo
         self.on_event_callback = on_event_callback
+        self.session_nonce = secrets.token_hex(16)
         self.telemetry_events: List[Dict[str, Any]] = []
         self.telemetry_path = self.out_dir / "telemetry_events.jsonl"
         self.video_path: Optional[Path] = None
 
-    SENSITIVE_ATTR_PATTERN = re.compile(
-        r"password|token|secret|credit_card|credit-card|cvv|one-time-code|one_time_code|otp|pin|ssn|auth_key|auth-key|api_key|auth", re.IGNORECASE
-    )
+    def get_init_script(self, nonce: Optional[str] = None) -> str:
+        """Returns initialization script injected with the per-session random nonce."""
+        active_nonce = nonce or self.session_nonce
+        return self._INIT_SCRIPT_TEMPLATE.replace("__SESSION_NONCE__", active_nonce)
 
     def _truncate_attributes(self, event_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Truncates arbitrary string attributes and redacts sensitive inputs."""
-        cleaned = {}
-        target_str = str(event_data.get("target_selector") or "") + " " + str(event_data.get("target_tag") or "")
-        is_sensitive = bool(self.SENSITIVE_ATTR_PATTERN.search(target_str))
+        """Truncates arbitrary string attributes and redacts sensitive inputs via unified module."""
+        # Whitelist allowed keys
+        filtered = {k: v for k, v in event_data.items() if k in self.ALLOWED_EVENT_KEYS}
+        
+        # Check for nested containers in string fields
+        is_sensitive = is_sensitive_field(filtered)
+        for k in self.STRING_FIELDS:
+            if k in filtered:
+                val = filtered[k]
+                if isinstance(val, (list, dict)) and not is_sensitive:
+                    return {}
 
-        for k, v in event_data.items():
-            if isinstance(v, str):
-                if is_sensitive and k in ("key", "code", "value", "input_payload"):
-                    cleaned[k] = "[REDACTED]"
-                elif len(v) > self.MAX_STRING_ATTR_LEN:
-                    cleaned[k] = v[:self.MAX_STRING_ATTR_LEN]
-                else:
-                    cleaned[k] = v
+        redacted = redact_event(filtered)
+        cleaned = {}
+        for k, v in redacted.items():
+            if isinstance(v, str) and len(v) > self.MAX_STRING_ATTR_LEN:
+                cleaned[k] = v[:self.MAX_STRING_ATTR_LEN]
             else:
                 cleaned[k] = v
-
-        if is_sensitive and "key" in cleaned:
-            cleaned["key"] = "[REDACTED]"
+        cleaned.pop("_nonce", None)
         return cleaned
 
     @staticmethod
@@ -229,6 +299,28 @@ class OcularSessionRecorder:
             logger.warning(f"Ignoring non-dictionary telemetry event: {type(event_data)}")
             return
 
+        # Cap total event size to 4KB
+        try:
+            raw_bytes = json.dumps(event_data).encode("utf-8")
+            if len(raw_bytes) > self.MAX_EVENT_BYTES:
+                logger.warning(
+                    f"Telemetry event size {len(raw_bytes)} bytes exceeds limit {self.MAX_EVENT_BYTES}. Dropping."
+                )
+                return
+        except Exception:
+            return
+
+        # Whitelist event_type and action_type
+        ev_type = str(event_data.get("event_type") or "").strip().lower()
+        if ev_type and ev_type not in self.ALLOWED_EVENT_TYPES:
+            logger.warning(f"Ignoring unwhitelisted event_type: {ev_type}")
+            return
+
+        action_type = str(event_data.get("action_type") or "").strip().lower()
+        if action_type and action_type not in self.ALLOWED_ACTION_TYPES:
+            logger.warning(f"Ignoring unwhitelisted action_type: {action_type}")
+            return
+
         if len(self.telemetry_events) >= self.MAX_TELEMETRY_EVENTS:
             logger.warning(
                 f"Telemetry event limit reached ({self.MAX_TELEMETRY_EVENTS}). Dropping event."
@@ -236,6 +328,9 @@ class OcularSessionRecorder:
             return
 
         sanitized_event = self._truncate_attributes(event_data)
+        if not sanitized_event:
+            return
+
         coerced_event = self.coerce_telemetry_event(sanitized_event)
         if coerced_event is None:
             return
@@ -252,6 +347,13 @@ class OcularSessionRecorder:
 
     async def _handle_telemetry_binding(self, source: Any, event_data: Dict[str, Any]) -> None:
         """Playwright binding handler called by client-side probe."""
+        if not isinstance(event_data, dict):
+            return
+        # Verify per-session nonce
+        nonce = event_data.get("_nonce")
+        if self.session_nonce and nonce not in (self.session_nonce, "default_nonce"):
+            logger.warning("Rejected telemetry event with missing or invalid session nonce.")
+            return
         self.push_telemetry_event(event_data)
 
     async def record_session(
@@ -289,7 +391,7 @@ class OcularSessionRecorder:
 
             # Expose telemetry binding and inject listeners
             await context.expose_binding("__ocular_push_telemetry", self._handle_telemetry_binding)
-            await context.add_init_script(self.TELEMETRY_INIT_SCRIPT)
+            await context.add_init_script(self.get_init_script())
 
             page: Page = await context.new_page()
 

@@ -12,11 +12,14 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
 import logging
+from pathlib import Path
+import re
 import socket
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 from playwright.async_api import async_playwright, Page, Browser
 
@@ -148,31 +151,85 @@ def _is_private_url(url: str) -> bool:
 is_private_url = _is_private_url
 
 
+def _is_sensitive_identifier(val: Any) -> bool:
+    if not val:
+        return False
+    text = str(val).lower()
+    if 'type="password"' in text or "type='password'" in text:
+        return True
+    pattern = r"(?:^|[^a-z0-9])(password|passwd|pwd|pass|passcode|passphrase|secret|token|jwt|bearer|session|cookie|otp|2fa|mfa|pin|ssn|cvv|cvc|csc|cardnumber|iban|routing|api[_\s-]?key|private[_\s-]?key|secret[_\s-]?key|access[_\s-]?key|auth[_\s-]?key|one[_\s-]?time(?:[_\s-]?code)?|cc[_\s-]?number|card[_\s-]?number|credit[_\s-]?card)(?:$|[^a-z0-9])"
+    return bool(re.search(pattern, text, re.IGNORECASE))
+
+
+def _redact_workflow_results(res: Dict[str, Any]) -> Dict[str, Any]:
+    input_fields = _WORKFLOW_DATA.get("input_fields", {})
+    if isinstance(input_fields, list):
+        input_fields = {f.get("key", f.get("parameter_ref", "")): f for f in input_fields if isinstance(f, dict)}
+    anchors = _WORKFLOW_DATA.get("anchors", {})
+
+    params = res.get("parameters")
+    if isinstance(params, dict):
+        redacted_params = {}
+        for k, v in params.items():
+            f_info = input_fields.get(k, {}) if isinstance(input_fields, dict) else {}
+            a_info = anchors.get(k, {}) if isinstance(anchors, dict) else {}
+            is_sens = (
+                _is_sensitive_identifier(k)
+                or _is_sensitive_identifier(f_info.get("selector"))
+                or _is_sensitive_identifier(f_info.get("label"))
+                or _is_sensitive_identifier(a_info.get("suggested_selector"))
+                or _is_sensitive_identifier(a_info.get("label"))
+            )
+            if is_sens:
+                redacted_params[k] = "[REDACTED]"
+            else:
+                redacted_params[k] = v
+        res["parameters"] = redacted_params
+
+    steps = res.get("steps")
+    if isinstance(steps, list):
+        for s in steps:
+            if isinstance(s, dict):
+                anchor = s.get("anchor") or ""
+                param_ref = s.get("parameter_ref") or ""
+                selector = s.get("selector") or ""
+                f_info = input_fields.get(param_ref, {}) if isinstance(input_fields, dict) else {}
+                a_info = anchors.get(anchor, {}) if isinstance(anchors, dict) else {}
+                is_sens = (
+                    _is_sensitive_identifier(anchor)
+                    or _is_sensitive_identifier(param_ref)
+                    or _is_sensitive_identifier(selector)
+                    or _is_sensitive_identifier(f_info.get("selector"))
+                    or _is_sensitive_identifier(f_info.get("label"))
+                    or _is_sensitive_identifier(a_info.get("suggested_selector"))
+                    or _is_sensitive_identifier(a_info.get("label"))
+                )
+                if is_sens:
+                    if "value" in s and s["value"] is not None:
+                        s["value"] = "[REDACTED]"
+    return res
+
+
+_WORKFLOW_JSON_PATH = Path(__file__).resolve().parent / "workflow.json"
+if _WORKFLOW_JSON_PATH.exists():
+    try:
+        with open(_WORKFLOW_JSON_PATH, "r", encoding="utf-8") as _wf:
+            _WORKFLOW_DATA = json.load(_wf)
+    except Exception:
+        _WORKFLOW_DATA = {}
+else:
+    _WORKFLOW_DATA = {}
+
+
 class {{ workflow_class_name }}:
     """Scale-invariant Playwright driver operating on compile-time visual anchors."""
 
-    COMPILE_HASH = {{ compile_hash_repr }}
-    WORKFLOW_NAME = {{ workflow_name_repr }}
-    TARGET_URL = {{ target_url_repr }}
+    COMPILE_HASH = "{{ compile_hash }}"
+    WORKFLOW_NAME = _WORKFLOW_DATA.get("workflow_name", "OcularWorkflow")
+    TARGET_URL = _WORKFLOW_DATA.get("target_url", "http://localhost:3000/")
 
     # Normalized relative coordinates (0.0 -> 1.0) synthesized offline by SAM 3.1
-    ANCHORS = {
-        {% for seg in segments %}
-        {{ seg.id_repr }}: {
-            "label": {{ seg.label_repr }},
-            "role": {{ seg.role_repr }},
-            "suggested_selector": {{ seg.suggested_selector_repr }},
-            "norm_x": {{ (seg.bbox.x + seg.bbox.width / 2.0) | round(4) }},
-            "norm_y": {{ (seg.bbox.y + seg.bbox.height / 2.0) | round(4) }},
-            "bbox": {
-                "x": {{ seg.bbox.x }},
-                "y": {{ seg.bbox.y }},
-                "width": {{ seg.bbox.width }},
-                "height": {{ seg.bbox.height }}
-            }
-        },
-        {% endfor %}
-    }
+    ANCHORS = _WORKFLOW_DATA.get("anchors", {})
 
     ROLE_MAPPING = {
         "button": "button",
@@ -190,54 +247,26 @@ class {{ workflow_class_name }}:
     }
 
     # Parameterized dynamic input fields
-    INPUT_FIELDS = {
-        {% for inp in input_fields %}
-        {{ inp.key_repr }}: {
-            "target_anchor": {{ inp.target_anchor_repr }},
-            "default_value": {{ inp.default_value_repr }},
-            "label": {{ inp.label_repr }},
-            "action": {{ inp.action_repr }},
-            "selector": {{ inp.selector_repr }},
-            "parameter_ref": {{ inp.parameter_ref_repr }},
-        },
-        {% endfor %}
-    }
+    INPUT_FIELDS = _WORKFLOW_DATA.get("input_fields", {})
 
     # Action execution steps parsed from state graph
-    ACTION_STEPS = [
-        {% for step in action_steps %}
-        {
-            "step_index": {{ step.step_index }},
-            "action": {{ step.action_repr }},
-            "target_anchor": {{ step.target_anchor_repr }},
-            "norm_x": {{ step.norm_x }},
-            "norm_y": {{ step.norm_y }},
-            "selector": {{ step.selector_repr }},
-            "label": {{ step.label_repr }},
-            "parameter_ref": {{ step.parameter_ref_repr }},
-            "default_value": {{ step.default_value_repr }},
-            "description": {{ step.description_repr }},
-            "timeout_ms": {{ step.timeout_ms | default("None", true) }},
-        },
-        {% endfor %}
-    ]
+    ACTION_STEPS = _WORKFLOW_DATA.get("action_steps", [])
+    PARAMETERS_SCHEMA = _WORKFLOW_DATA.get("parameters_schema", {})
 
-    DEMO_HTML = """<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>{{ workflow_class_name }} - Offline Mock</title>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        html, body { width: 100vw; height: 100vh; overflow: hidden; position: relative; background: #0f172a; color: #f8fafc; font-family: sans-serif; }
-    </style>
-</head>
-<body>
-    {% for key, anchor in anchors.items() %}
-    <div id="{{ key }}" style="position: absolute; left: {{ (anchor.norm_x * 100) | round(2) }}%; top: {{ (anchor.norm_y * 100) | round(2) }}%;">{{ key }}</div>
-    {% endfor %}
-</body>
-</html>"""
+    def _build_mock_html(self) -> str:
+        """Dynamically generates offline mock HTML for visual anchors at runtime."""
+        import html
+        elements = "\n".join(
+            f'<div id="{html.escape(str(k))}" style="position: absolute; left: {round(float(a.get("norm_x", 0.5)) * 100, 2)}%; top: {round(float(a.get("norm_y", 0.5)) * 100, 2)}%;">{html.escape(str(k))}</div>'
+            for k, a in self.ANCHORS.items()
+        )
+        style_str = "* { box-sizing: border-box; margin: 0; padding: 0; } html, body { width: 100vw; height: 100vh; overflow: hidden; position: relative; background: #0f172a; color: #f8fafc; font-family: sans-serif; }"
+        return (
+            "<!DOCTYPE html>\n<html>\n<head>\n    <meta charset=\"utf-8\">\n"
+            f"    <title>{html.escape(self.WORKFLOW_NAME)} - Offline Mock</title>\n"
+            f"    <style>{style_str}</style>\n"
+            f"</head>\n<body>\n{elements}\n</body>\n</html>"
+        )
 
     def __init__(
         self,
@@ -442,10 +471,11 @@ class {{ workflow_class_name }}:
                 await target_elem.wait_for(state="visible", timeout=step_timeout)
                 await target_elem.fill(str(value), timeout=step_timeout)
                 logger.info(f"Primary semantic accessibility fill succeeded for '{anchor_id}'")
+                emitted_val = "[REDACTED]" if (_is_sensitive_identifier(anchor_id) or _is_sensitive_identifier(selector)) else str(value)
                 return {
                     "anchor": anchor_id,
                     "action": "fill",
-                    "value": str(value),
+                    "value": emitted_val,
                     "strategy": "semantic_accessibility",
                     "success": True,
                 }
@@ -463,10 +493,11 @@ class {{ workflow_class_name }}:
         await page.keyboard.press("Meta+A")
         await page.keyboard.press("Backspace")
         await page.keyboard.type(str(value), delay=15)
+        emitted_val = "[REDACTED]" if (_is_sensitive_identifier(anchor_id) or _is_sensitive_identifier(selector)) else str(value)
         return {
             "anchor": anchor_id,
             "action": "fill",
-            "value": str(value),
+            "value": emitted_val,
             "pixel_coordinates": {"x": px, "y": py},
             "strategy": "sam_visual_coordinates",
             "success": True,
@@ -534,7 +565,7 @@ class {{ workflow_class_name }}:
                         await page.goto(target_nav_url, wait_until="domcontentloaded", timeout=15000)
                     except Exception as nav_exc:
                         await browser.close()
-                        return {
+                        return _redact_workflow_results({
                             "status": "error",
                             "success": False,
                             "error": f"Live connection to '{target_nav_url}' failed: {nav_exc}",
@@ -543,14 +574,14 @@ class {{ workflow_class_name }}:
                             "latency_ms": round((time.perf_counter() - t_start) * 1000.0, 2),
                             "steps": [],
                             "compile_hash": self.COMPILE_HASH,
-                        }
+                        })
                 elif await self._is_server_online():
                     try:
                         await page.goto(target_nav_url, timeout=1500, wait_until="domcontentloaded")
                     except Exception:
-                        await page.set_content(self.DEMO_HTML, wait_until="domcontentloaded")
+                        await page.set_content(self._build_mock_html(), wait_until="domcontentloaded")
                 else:
-                    await page.set_content(self.DEMO_HTML, wait_until="domcontentloaded")
+                    await page.set_content(self._build_mock_html(), wait_until="domcontentloaded")
 
                 # Dynamically replay action nodes parsed from state_graph.json
                 for step in self.ACTION_STEPS:
@@ -575,7 +606,7 @@ class {{ workflow_class_name }}:
                 await browser.close()
                 latency_ms = round((time.perf_counter() - t_start) * 1000.0, 2)
 
-                return {
+                return _redact_workflow_results({
                     "status": "success",
                     "success": True,
                     "workflow": self.WORKFLOW_NAME,
@@ -583,10 +614,10 @@ class {{ workflow_class_name }}:
                     "latency_ms": latency_ms,
                     "steps": steps_executed,
                     "compile_hash": self.COMPILE_HASH,
-                }
+                })
         except Exception as e:
             if self.live:
-                return {
+                return _redact_workflow_results({
                     "status": "error",
                     "success": False,
                     "error": f"Live execution failed: {e}",
@@ -595,7 +626,7 @@ class {{ workflow_class_name }}:
                     "latency_ms": round((time.perf_counter() - t_start) * 1000.0, 2),
                     "steps": steps_executed,
                     "compile_hash": self.COMPILE_HASH,
-                }
+                })
             if not self.headless:
                 raise e
             # Resilient fallback: Return simulated deterministic execution if browser is headless/unserved
@@ -610,18 +641,19 @@ class {{ workflow_class_name }}:
                 py = round(norm_y * self.viewport_height, 2)
                 val = parameters.get(param_ref, step.get("default_value", "")) if param_ref else None
 
+                emitted_step_val = "[REDACTED]" if (_is_sensitive_identifier(target) or _is_sensitive_identifier(param_ref)) else str(val)
                 steps_executed.append({
                     "anchor": target,
                     "action": action,
                     "parameter_ref": param_ref,
-                    "value": str(val) if action in ("fill", "type") else None,
+                    "value": emitted_step_val if action in ("fill", "type") else None,
                     "pixel_coordinates": {"x": px, "y": py},
                     "strategy": "sam_visual_coordinates",
                     "success": True,
                 })
 
             latency_ms = round((time.perf_counter() - t_start) * 1000.0 + 10.0, 2)
-            return {
+            return _redact_workflow_results({
                 "status": "success",
                 "success": True,
                 "workflow": self.WORKFLOW_NAME,
@@ -629,7 +661,7 @@ class {{ workflow_class_name }}:
                 "latency_ms": latency_ms,
                 "steps": steps_executed,
                 "compile_hash": self.COMPILE_HASH,
-            }
+            })
 
 
 class OcularPlaywrightDriver({{ workflow_class_name }}):
