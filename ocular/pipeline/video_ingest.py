@@ -129,6 +129,44 @@ class VideoIngestSampler:
 
         return diff_score, roi_bbox, motion_energy
 
+    @staticmethod
+    def coerce_telemetry_event(event: Any) -> Optional[Dict[str, Any]]:
+        """Safely coerces numeric fields in a telemetry event dictionary, rejecting non-dict objects."""
+        if not isinstance(event, dict):
+            return None
+        e = dict(event)
+        # Coerce elapsed_ms safely via int(event.get("elapsed_ms") or 0) inside try ... except
+        try:
+            val = e.get("elapsed_ms")
+            if val is None:
+                raw_ts = e.get("timestamp_ms")
+                val = raw_ts if raw_ts is not None else 0
+            e["elapsed_ms"] = int(float(val) if isinstance(val, str) else (val or 0))
+        except (ValueError, TypeError):
+            e["elapsed_ms"] = 0
+
+        # Coerce timestamp_ms
+        try:
+            val_ts = e.get("timestamp_ms")
+            e["timestamp_ms"] = float(val_ts) if val_ts is not None else float(e["elapsed_ms"])
+        except (ValueError, TypeError):
+            e["timestamp_ms"] = float(e["elapsed_ms"])
+
+        # Coerce norm_x and norm_y coordinates safely via float(...) with fallback to 0.0
+        try:
+            val_x = e.get("norm_x")
+            e["norm_x"] = float(val_x) if val_x is not None else 0.0
+        except (ValueError, TypeError):
+            e["norm_x"] = 0.0
+
+        try:
+            val_y = e.get("norm_y")
+            e["norm_y"] = float(val_y) if val_y is not None else 0.0
+        except (ValueError, TypeError):
+            e["norm_y"] = 0.0
+
+        return e
+
     def sample_transitions(
         self,
         video_path: Union[str, Path],
@@ -161,16 +199,20 @@ class VideoIngestSampler:
         prev_gray: Optional[np.ndarray] = None
         frame_idx = 0
 
+        # Sanitize and coerce telemetry events
+        sanitized_telemetry: List[Dict[str, Any]] = []
+        if telemetry_events:
+            for e in telemetry_events:
+                coerced = self.coerce_telemetry_event(e)
+                if coerced is not None:
+                    sanitized_telemetry.append(coerced)
+
         # Filter telemetry clicks as point-prompt priors
-        click_events = (
-            [
-                e
-                for e in telemetry_events
-                if isinstance(e, dict) and (e.get("event_type") == "mousedown" or e.get("action_type") == "click")
-            ]
-            if telemetry_events
-            else []
-        )
+        click_events = [
+            e
+            for e in sanitized_telemetry
+            if e.get("event_type") == "mousedown" or e.get("action_type") == "click"
+        ]
 
         while True:
             if frame_idx % step == 0:
@@ -357,15 +399,19 @@ class VideoIngestSampler:
         transitions: List[TransitionEvent] = []
         prev_gray: Optional[np.ndarray] = None
 
-        click_events = (
-            [
-                e
-                for e in telemetry_events
-                if isinstance(e, dict) and (e.get("event_type") == "mousedown" or e.get("action_type") == "click")
-            ]
-            if telemetry_events
-            else []
-        )
+        # Sanitize and coerce telemetry events
+        sanitized_telemetry: List[Dict[str, Any]] = []
+        if telemetry_events:
+            for e in telemetry_events:
+                coerced = self.coerce_telemetry_event(e)
+                if coerced is not None:
+                    sanitized_telemetry.append(coerced)
+
+        click_events = [
+            e
+            for e in sanitized_telemetry
+            if e.get("event_type") == "mousedown" or e.get("action_type") == "click"
+        ]
 
         for idx, frame in enumerate(frames):
             h, w = frame.shape[:2]

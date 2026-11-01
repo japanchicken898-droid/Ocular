@@ -48,6 +48,114 @@ BLOCKED_IP_NETWORKS = [
 BLOCKED_PRIVATE_NETWORKS = BLOCKED_IP_NETWORKS
 
 
+def _parse_ip_safe(host: str) -> Optional[Union[ipaddress.IPv4Address, ipaddress.IPv6Address]]:
+    """Deterministically parse host into an IP address, handling IPv4-mapped IPv6, octal, hex, and int."""
+    if not host:
+        return None
+    h = host.strip("[]")
+    # 1. Standard ipaddress parser
+    try:
+        ip = ipaddress.ip_address(h)
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+            return ip.ipv4_mapped
+        return ip
+    except ValueError:
+        pass
+
+    # 2. Integer or Hexadecimal IPv4 notation (e.g. 2130706433, 0x7f000001, 017700000001)
+    try:
+        if h.startswith(("0x", "0X")):
+            val = int(h, 16)
+            if 0 <= val <= 0xFFFFFFFF:
+                return ipaddress.IPv4Address(val)
+        elif h.isdigit():
+            val = int(h, 8) if (len(h) > 1 and h.startswith("0") and set(h) <= set("01234567")) else int(h, 10)
+            if 0 <= val <= 0xFFFFFFFF:
+                return ipaddress.IPv4Address(val)
+    except (ValueError, OverflowError):
+        pass
+
+    # 3. Dotted octal/hex notation (e.g. 0177.0.0.1, 0x7f.0.0.1)
+    try:
+        raw_bytes = socket.inet_aton(h)
+        return ipaddress.IPv4Address(raw_bytes)
+    except (OSError, ValueError):
+        pass
+
+    # 4. Fallback manual dotted parsing
+    parts = h.split(".")
+    if len(parts) == 4:
+        try:
+            coerced = []
+            for p in parts:
+                if p.startswith(("0x", "0X")):
+                    coerced.append(str(int(p, 16)))
+                elif p.startswith("0") and len(p) > 1 and p.isdigit():
+                    coerced.append(str(int(p, 8)))
+                elif p.isdigit():
+                    coerced.append(str(int(p, 10)))
+                else:
+                    break
+            if len(coerced) == 4:
+                return ipaddress.IPv4Address(".".join(coerced))
+        except (ValueError, OverflowError):
+            pass
+
+    return None
+
+
+def _is_private_url(url: str) -> bool:
+    """Check if a URL resolves to a private/loopback subnet or uses an unsafe scheme."""
+    try:
+        if not url or not isinstance(url, str):
+            return True
+        url_str = url.strip()
+        parsed = urlparse(url_str)
+        scheme = (parsed.scheme or "").lower()
+
+        # Reject non-http/https schemes (file, data, blob, about, gopher, etc.)
+        if scheme:
+            if scheme not in ("http", "https"):
+                return True
+        elif "://" in url_str:
+            return True
+
+        hostname = parsed.hostname
+        if not hostname:
+            first_seg = url_str.split("/")[0]
+            if first_seg.startswith("[") and "]" in first_seg:
+                hostname = first_seg[1:first_seg.index("]")]
+            else:
+                hostname = first_seg.split(":")[0]
+
+        if not hostname:
+            return True
+
+        if hostname.lower() in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+            return True
+
+        ip_obj = _parse_ip_safe(hostname)
+        if ip_obj is not None:
+            return any(ip_obj in net for net in BLOCKED_IP_NETWORKS)
+
+        try:
+            addr_info = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            for entry in addr_info:
+                ip_str = entry[4][0]
+                resolved_ip = _parse_ip_safe(ip_str)
+                if resolved_ip is not None and any(resolved_ip in net for net in BLOCKED_IP_NETWORKS):
+                    return True
+        except socket.gaierror:
+            pass
+
+        return False
+    except Exception:
+        return True
+
+
+is_private_url = _is_private_url
+
+
 async def validate_safe_url(url: str, allow_local: Optional[bool] = None) -> str:
     """Validates that base_url does not resolve to private, loopback, or metadata subnets (SSRF protection)."""
     if allow_local is None:
@@ -82,6 +190,16 @@ async def validate_safe_url(url: str, allow_local: Optional[bool] = None) -> str
             detail=f"Target URL points to blocked loopback address: '{hostname}'."
         )
 
+    # Check direct IP representation (including IPv4-mapped, hex, octal, int)
+    direct_ip = _parse_ip_safe(hostname)
+    if direct_ip is not None:
+        for net in BLOCKED_IP_NETWORKS:
+            if direct_ip in net:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Target URL '{hostname}' resolves to restricted private/loopback subnet ({direct_ip} in {net})."
+                )
+
     loop = asyncio.get_running_loop()
     try:
         addr_info = await asyncio.wait_for(
@@ -96,16 +214,14 @@ async def validate_safe_url(url: str, allow_local: Optional[bool] = None) -> str
 
     for entry in addr_info:
         ip_str = entry[4][0]
-        try:
-            ip_obj = ipaddress.ip_address(ip_str)
+        ip_obj = _parse_ip_safe(ip_str)
+        if ip_obj is not None:
             for net in BLOCKED_IP_NETWORKS:
                 if ip_obj in net:
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail=f"Target URL '{hostname}' resolves to restricted private/loopback subnet ({ip_str} in {net})."
                     )
-        except ValueError:
-            continue
 
     return url.rstrip("/")
 

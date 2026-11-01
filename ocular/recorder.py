@@ -185,6 +185,44 @@ class OcularSessionRecorder:
             cleaned["key"] = "[REDACTED]"
         return cleaned
 
+    @staticmethod
+    def coerce_telemetry_event(event: Any) -> Optional[Dict[str, Any]]:
+        """Safely coerces numeric fields in a telemetry event dictionary, rejecting non-dict objects."""
+        if not isinstance(event, dict):
+            return None
+        e = dict(event)
+        # Coerce elapsed_ms safely via int(event.get("elapsed_ms") or 0) inside try ... except
+        try:
+            val = e.get("elapsed_ms")
+            if val is None:
+                raw_ts = e.get("timestamp_ms")
+                val = raw_ts if raw_ts is not None else 0
+            e["elapsed_ms"] = int(float(val) if isinstance(val, str) else (val or 0))
+        except (ValueError, TypeError):
+            e["elapsed_ms"] = 0
+
+        # Coerce timestamp_ms
+        try:
+            val_ts = e.get("timestamp_ms")
+            e["timestamp_ms"] = float(val_ts) if val_ts is not None else float(e["elapsed_ms"])
+        except (ValueError, TypeError):
+            e["timestamp_ms"] = float(e["elapsed_ms"])
+
+        # Coerce norm_x and norm_y coordinates safely via float(...) with fallback to 0.0
+        try:
+            val_x = e.get("norm_x")
+            e["norm_x"] = float(val_x) if val_x is not None else 0.0
+        except (ValueError, TypeError):
+            e["norm_x"] = 0.0
+
+        try:
+            val_y = e.get("norm_y")
+            e["norm_y"] = float(val_y) if val_y is not None else 0.0
+        except (ValueError, TypeError):
+            e["norm_y"] = 0.0
+
+        return e
+
     def push_telemetry_event(self, event_data: Dict[str, Any]) -> None:
         """Appends an event to in-memory history and streams to telemetry_events.jsonl."""
         if not isinstance(event_data, dict):
@@ -198,13 +236,17 @@ class OcularSessionRecorder:
             return
 
         sanitized_event = self._truncate_attributes(event_data)
-        self.telemetry_events.append(sanitized_event)
+        coerced_event = self.coerce_telemetry_event(sanitized_event)
+        if coerced_event is None:
+            return
+
+        self.telemetry_events.append(coerced_event)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         with open(self.telemetry_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(sanitized_event) + "\n")
+            f.write(json.dumps(coerced_event) + "\n")
         if self.on_event_callback:
             try:
-                self.on_event_callback(sanitized_event)
+                self.on_event_callback(coerced_event)
             except Exception as e:
                 logger.debug(f"Error in on_event_callback: {e}")
 
@@ -320,7 +362,9 @@ class OcularSessionRecorder:
                     try:
                         data = json.loads(line)
                         if isinstance(data, dict):
-                            events.append(data)
+                            coerced = OcularSessionRecorder.coerce_telemetry_event(data)
+                            if coerced is not None:
+                                events.append(coerced)
                         else:
                             logger.debug(f"Ignoring non-dictionary telemetry payload: {type(data)}")
                     except (json.JSONDecodeError, ValueError):

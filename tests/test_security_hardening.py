@@ -676,6 +676,163 @@ def test_fail_explicit_ingestion_zero_actionable_elements():
     assert any("custom_login_btn" in nid for nid in custom_dag["nodes"])
 
 
+def test_ssrf_blocks_ipv4_mapped_ipv6_and_schemes(tmp_path: Path):
+    """Verify that IPv4-mapped IPv6, non-HTTP schemes, and alternate IPv4 encodings are blocked by SSRF guards."""
+    from ocular.pipeline.code_generator import JinjaCodeGenerator
+    import sys
+    import importlib
+    import pytest
+    from fastapi import HTTPException
+
+    generator = JinjaCodeGenerator()
+    out_dir = tmp_path / "ssrf_guard_dist"
+    generator.emit(dag={"workflow_name": "SsrfGuardWorkflow"}, segments=[], out_dir=out_dir)
+
+    sys.modules.pop("playwright_driver", None)
+    sys.modules.pop("app", None)
+    sys.path.insert(0, str(out_dir.resolve()))
+    try:
+        driver_mod = importlib.import_module("playwright_driver")
+        app_mod = importlib.import_module("app")
+
+        is_priv_driver = getattr(driver_mod, "is_private_url")
+        is_priv_app = getattr(app_mod, "is_private_url")
+
+        blocked_test_cases = [
+            # IPv4-mapped IPv6
+            "[::ffff:127.0.0.1]",
+            "http://[::ffff:127.0.0.1]",
+            "http://[::ffff:127.0.0.1]:8080/admin",
+            "http://[::ffff:10.0.0.1]",
+            "http://[::ffff:169.254.169.254]",
+            # Non-HTTP / dangerous URI schemes
+            "file:///etc/passwd",
+            "file:///C:/Windows/win.ini",
+            "data:text/html,<html>test</html>",
+            "blob:http://example.com/uuid",
+            "about:blank",
+            "gopher://127.0.0.1:70/_status",
+            # Encoded IPv4 variations (octal, hex, dword int)
+            "http://0x7f000001",
+            "http://2130706433",
+            "http://0177.0.0.1",
+            "http://017700000001",
+        ]
+
+        for url in blocked_test_cases:
+            assert is_priv_driver(url) is True, f"driver should block {url}"
+            assert is_priv_app(url) is True, f"app should block {url}"
+
+        # Allowed public endpoints
+        allowed_test_cases = [
+            "https://8.8.8.8",
+            "http://[::ffff:8.8.8.8]",
+            "https://1.1.1.1/dns-query",
+        ]
+        for url in allowed_test_cases:
+            assert is_priv_driver(url) is False, f"driver should allow {url}"
+            assert is_priv_app(url) is False, f"app should allow {url}"
+
+        # Test FastAPI validate_safe_url rejecting non-http and private targets
+        validate_fn = getattr(app_mod, "validate_safe_url")
+        for bad_url in [
+            "file:///etc/passwd",
+            "data:text/plain;base64,SGVsbG8=",
+            "http://[::ffff:127.0.0.1]",
+            "http://0x7f000001",
+        ]:
+            with pytest.raises(HTTPException) as exc_info:
+                import asyncio
+                asyncio.run(validate_fn(bad_url))
+            assert exc_info.value.status_code == 400
+
+    finally:
+        sys.modules.pop("playwright_driver", None)
+        sys.modules.pop("app", None)
+        if str(out_dir.resolve()) in sys.path:
+            sys.path.remove(str(out_dir.resolve()))
+
+
+def test_telemetry_numeric_field_coercion(tmp_path: Path):
+    """Verify that string timestamps, coordinates, and nulls in telemetry are safely coerced without TypeErrors."""
+    import numpy as np
+    from ocular.recorder import OcularSessionRecorder
+    from ocular.pipeline.video_ingest import VideoIngestSampler
+
+    # 1. Test OcularSessionRecorder coercion
+    raw_event_strings = {
+        "event_type": "mousedown",
+        "action_type": "click",
+        "elapsed_ms": "1250",
+        "timestamp_ms": "1250.5",
+        "norm_x": "0.45",
+        "norm_y": "0.85",
+        "target_selector": "#submit-btn",
+    }
+    coerced = OcularSessionRecorder.coerce_telemetry_event(raw_event_strings)
+    assert isinstance(coerced["elapsed_ms"], int)
+    assert coerced["elapsed_ms"] == 1250
+    assert isinstance(coerced["timestamp_ms"], float)
+    assert coerced["timestamp_ms"] == 1250.5
+    assert isinstance(coerced["norm_x"], float)
+    assert coerced["norm_x"] == 0.45
+    assert isinstance(coerced["norm_y"], float)
+    assert coerced["norm_y"] == 0.85
+
+    # 2. Test nulls and malformed non-numeric values
+    raw_event_nulls = {
+        "event_type": "keydown",
+        "elapsed_ms": None,
+        "timestamp_ms": None,
+        "norm_x": None,
+        "norm_y": None,
+    }
+    coerced_nulls = OcularSessionRecorder.coerce_telemetry_event(raw_event_nulls)
+    assert coerced_nulls["elapsed_ms"] == 0
+    assert coerced_nulls["timestamp_ms"] == 0.0
+    assert coerced_nulls["norm_x"] == 0.0
+    assert coerced_nulls["norm_y"] == 0.0
+
+    raw_event_garbage = {
+        "event_type": "mousedown",
+        "elapsed_ms": "invalid_number",
+        "norm_x": "NaN_value",
+        "norm_y": {},
+    }
+    coerced_garbage = OcularSessionRecorder.coerce_telemetry_event(raw_event_garbage)
+    assert coerced_garbage["elapsed_ms"] == 0
+    assert coerced_garbage["norm_x"] == 0.0
+    assert coerced_garbage["norm_y"] == 0.0
+
+    # 3. Test VideoIngestSampler.coerce_telemetry_event matches
+    coerced_sampler = VideoIngestSampler.coerce_telemetry_event(raw_event_strings)
+    assert coerced_sampler["elapsed_ms"] == 1250
+    assert coerced_sampler["norm_x"] == 0.45
+
+    # 4. Test ingestion timeline with diverse string and null types without TypeError
+    sampler = VideoIngestSampler(sample_rate=2.0)
+    frames = [np.zeros((100, 100, 3), dtype=np.uint8) for _ in range(4)]
+    mixed_telemetry = [
+        {"event_type": "mousedown", "action_type": "click", "elapsed_ms": "500", "norm_x": "0.1", "norm_y": "0.2"},
+        {"event_type": "mousedown", "action_type": "click", "elapsed_ms": None, "norm_x": None, "norm_y": None},
+        {"event_type": "mousedown", "action_type": "click", "elapsed_ms": 1500, "norm_x": 0.5, "norm_y": 0.5},
+        {"event_type": "mousedown", "action_type": "click", "elapsed_ms": "invalid", "norm_x": "bad"},
+        ["non-dict-ignored"],
+        None,
+    ]
+
+    f_meta, transitions, _ = sampler.process_frames_list(frames, telemetry_events=mixed_telemetry)
+    assert len(f_meta) == 4
+
+    # 5. Verify timeline sorting by elapsed_ms never raises TypeError
+    sorted_events = sorted(
+        [e for e in mixed_telemetry if VideoIngestSampler.coerce_telemetry_event(e)],
+        key=lambda ev: VideoIngestSampler.coerce_telemetry_event(ev)["elapsed_ms"]
+    )
+    assert len(sorted_events) == 4
+    assert sorted_events[-1]["elapsed_ms"] == 1500
+
+
 
 
 
