@@ -134,14 +134,18 @@ class {{ workflow_class_name }}:
         self.semantic_timeout_ms = semantic_timeout_ms
         self.live = live
 
-    def _is_server_online(self, timeout_sec: float = 0.05) -> bool:
-        """Lightweight non-browser probe to check if target application server is listening."""
+    async def _is_server_online(self, timeout_sec: float = 0.5) -> bool:
+        """Lightweight non-blocking async probe to check if target application server is listening."""
         try:
-            parsed = urlparse(self.base_url)
+            target_url = self.base_url or self.TARGET_URL
+            parsed = urlparse(target_url)
             host = parsed.hostname or "127.0.0.1"
             port = parsed.port or (443 if parsed.scheme == "https" else 80)
-            with socket.create_connection((host, port), timeout=timeout_sec):
-                return True
+            conn_coro = asyncio.open_connection(host, port)
+            reader, writer = await asyncio.wait_for(conn_coro, timeout=timeout_sec)
+            writer.close()
+            await writer.wait_closed()
+            return True
         except Exception:
             return False
 
@@ -380,12 +384,27 @@ class {{ workflow_class_name }}:
                 )
                 page: Page = await context.new_page()
 
+                target_nav_url = (self.base_url or self.TARGET_URL).rstrip("/")
+
                 # Step 0: Directly load canvas content if offline to prevent error flash
                 if self.live:
-                    await page.goto(self.TARGET_URL)
-                elif self._is_server_online():
                     try:
-                        await page.goto(self.base_url, timeout=1500, wait_until="domcontentloaded")
+                        await page.goto(target_nav_url, wait_until="domcontentloaded", timeout=15000)
+                    except Exception as nav_exc:
+                        await browser.close()
+                        return {
+                            "status": "error",
+                            "success": False,
+                            "error": f"Live connection to '{target_nav_url}' failed: {nav_exc}",
+                            "workflow": self.WORKFLOW_NAME,
+                            "parameters": active_inputs,
+                            "latency_ms": round((time.perf_counter() - t_start) * 1000.0, 2),
+                            "steps": [],
+                            "compile_hash": self.COMPILE_HASH,
+                        }
+                elif await self._is_server_online():
+                    try:
+                        await page.goto(target_nav_url, timeout=1500, wait_until="domcontentloaded")
                     except Exception:
                         await page.set_content(self.DEMO_HTML, wait_until="domcontentloaded")
                 else:
@@ -415,6 +434,7 @@ class {{ workflow_class_name }}:
 
                 return {
                     "status": "success",
+                    "success": True,
                     "workflow": self.WORKFLOW_NAME,
                     "parameters": active_inputs,
                     "latency_ms": latency_ms,
@@ -422,6 +442,17 @@ class {{ workflow_class_name }}:
                     "compile_hash": self.COMPILE_HASH,
                 }
         except Exception as e:
+            if self.live:
+                return {
+                    "status": "error",
+                    "success": False,
+                    "error": f"Live execution failed: {e}",
+                    "workflow": self.WORKFLOW_NAME,
+                    "parameters": active_inputs,
+                    "latency_ms": round((time.perf_counter() - t_start) * 1000.0, 2),
+                    "steps": steps_executed,
+                    "compile_hash": self.COMPILE_HASH,
+                }
             if not self.headless:
                 raise e
             # Resilient fallback: Return simulated deterministic execution if browser is headless/unserved
@@ -449,6 +480,7 @@ class {{ workflow_class_name }}:
             latency_ms = round((time.perf_counter() - t_start) * 1000.0 + 10.0, 2)
             return {
                 "status": "success",
+                "success": True,
                 "workflow": self.WORKFLOW_NAME,
                 "parameters": active_inputs,
                 "latency_ms": latency_ms,

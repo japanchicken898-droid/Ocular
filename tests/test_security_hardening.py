@@ -332,4 +332,112 @@ def test_cli_bracket_paths_markup_escape():
     assert exit_code == 1
 
 
+@pytest.mark.asyncio
+async def test_driver_live_mode_fails_without_tautological_fallback(tmp_path: Path):
+    """Verify that live mode fails explicitly when connection fails, rather than falling back to DEMO_HTML."""
+    video_path = tmp_path / "sample.mp4"
+    generate_synthetic_screen_recording(video_path, fps=30, width=1280, height=720)
+
+    dist_dir = tmp_path / "driver_live_test"
+    compile_command(input_path=str(video_path), out_dir=str(dist_dir))
+
+    import sys
+    import importlib
+
+    sys.path.insert(0, str(dist_dir.resolve()))
+    try:
+        driver_mod = importlib.import_module("playwright_driver")
+        workflow_cls = getattr(driver_mod, "OcularPlaywrightDriver")
+
+        # 1. Unreachable port in live mode must return success: False and status: 'error'
+        driver = workflow_cls(
+            base_url="http://127.0.0.1:59999",
+            headless=True,
+            live=True,
+        )
+        res = await driver.execute_workflow()
+        assert res.get("success") is False
+        assert res.get("status") == "error"
+        assert "Live connection to 'http://127.0.0.1:59999' failed" in res.get("error", "")
+
+        # 2. Verify that --base-url is honored over TARGET_URL in live mode
+        driver_override = workflow_cls(
+            base_url="https://override.example.com",
+            live=True,
+        )
+        assert driver_override.base_url == "https://override.example.com"
+        assert driver_override.live is True
+
+        # 3. Test non-blocking _is_server_online probe
+        is_online = await driver._is_server_online(timeout_sec=0.1)
+        assert is_online is False
+    finally:
+        if str(dist_dir.resolve()) in sys.path:
+            sys.path.remove(str(dist_dir.resolve()))
+
+
+def test_pydantic_422_parameter_validation_and_async_dns(tmp_path: Path):
+    """Verify that parameter type mismatches return clean HTTP 422 and validate_safe_url is non-blocking."""
+    video_path = tmp_path / "sample.mp4"
+    generate_synthetic_screen_recording(video_path, fps=30, width=1280, height=720)
+
+    dist_dir = tmp_path / "pydantic_validation_dist"
+    compile_command(input_path=str(video_path), out_dir=str(dist_dir))
+
+    import sys
+    import importlib
+
+    sys.path.insert(0, str(dist_dir.resolve()))
+    try:
+        app_mod = importlib.import_module("app")
+        app = app_mod.app
+        client = TestClient(app)
+
+        # 1. Parameter type mismatch in nested parameters dict must return 422
+        res_mismatch = client.post(
+            "/api/v1/execute",
+            json={
+                "parameters": {
+                    "viewport_width": "not-a-valid-int",
+                }
+            },
+        )
+        assert res_mismatch.status_code == 422
+
+        # 2. Parameter type mismatch in top-level request body must return 422
+        res_top_mismatch = client.post(
+            "/api/v1/execute",
+            json={
+                "viewport_width": "not-an-int",
+            },
+        )
+        assert res_top_mismatch.status_code == 422
+
+        # 3. Non-blocking validate_safe_url check
+        import asyncio
+        from unittest.mock import patch
+        loop = asyncio.new_event_loop()
+        try:
+            # Valid domain with mocked DNS resolution to public IP
+            with patch.object(
+                loop, "getaddrinfo", return_value=[(None, None, None, None, ("93.184.216.34", 0))]
+            ):
+                validated = loop.run_until_complete(
+                    app_mod.validate_safe_url("https://example.com")
+                )
+                assert validated == "https://example.com"
+
+            # Blocked SSRF loopback
+            with pytest.raises(Exception) as exc_info:
+                loop.run_until_complete(
+                    app_mod.validate_safe_url("http://127.0.0.1:8080")
+                )
+            assert "blocked loopback" in str(exc_info.value).lower()
+        finally:
+            loop.close()
+    finally:
+        if str(dist_dir.resolve()) in sys.path:
+            sys.path.remove(str(dist_dir.resolve()))
+
+
 

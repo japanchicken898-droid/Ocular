@@ -22,7 +22,7 @@ import uuid
 from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 _BASE_DIR = Path(__file__).resolve().parent
 if str(_BASE_DIR) not in sys.path:
@@ -47,7 +47,7 @@ BLOCKED_IP_NETWORKS = [
 ]
 
 
-def validate_safe_url(url: str, allow_local: Optional[bool] = None) -> str:
+async def validate_safe_url(url: str, allow_local: Optional[bool] = None) -> str:
     """Validates that base_url does not resolve to private, loopback, or metadata subnets (SSRF protection)."""
     if allow_local is None:
         allow_local = os.environ.get("OCULAR_ALLOW_LOCAL_BASE_URL", "0").lower() in ("1", "true")
@@ -81,9 +81,13 @@ def validate_safe_url(url: str, allow_local: Optional[bool] = None) -> str:
             detail=f"Target URL points to blocked loopback address: '{hostname}'."
         )
 
+    loop = asyncio.get_running_loop()
     try:
-        addr_info = socket.getaddrinfo(hostname, None)
-    except socket.gaierror as exc:
+        addr_info = await asyncio.wait_for(
+            loop.getaddrinfo(hostname, None),
+            timeout=float(os.environ.get("OCULAR_DNS_TIMEOUT_SEC", "3.0")),
+        )
+    except (asyncio.TimeoutError, socket.gaierror) as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Unable to resolve target host '{hostname}': {exc}"
@@ -103,6 +107,21 @@ def validate_safe_url(url: str, allow_local: Optional[bool] = None) -> str:
             continue
 
     return url.rstrip("/")
+
+
+async def _is_server_online(url: str, timeout_sec: float = 0.5) -> bool:
+    """Non-blocking async probe to check if target server is listening."""
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        conn_coro = asyncio.open_connection(host, port)
+        reader, writer = await asyncio.wait_for(conn_coro, timeout=timeout_sec)
+        writer.close()
+        await writer.wait_closed()
+        return True
+    except Exception:
+        return False
 
 
 # Concurrency Control: Cap simultaneous browser execution runs
@@ -167,8 +186,9 @@ class ExecutionPayload(BaseModel):
     """Dynamically synthesized parameter payload model from DAG parameters_schema."""
     {% if has_parameterized_inputs and parameters_schema and parameters_schema.properties %}
     {% for prop_name, prop_meta in parameters_schema.properties.items() %}
-    {{ prop_name }}: str = Field(
-        default={{ prop_meta.default | tojson if prop_meta.default is defined else "''" }},
+    {% set py_type = "int" if prop_meta.type == "integer" else ("bool" if prop_meta.type == "boolean" else ("float" if prop_meta.type == "number" else "str")) %}
+    {{ prop_name }}: {{ py_type }} = Field(
+        default={{ prop_meta.default | tojson if prop_meta.default is defined else ("0" if prop_meta.type == "integer" else "''") }},
         description={{ prop_meta.description | tojson if prop_meta.description is defined else "''" }}
     )
     {% endfor %}
@@ -190,6 +210,7 @@ class ExecuteWorkflowRequest(BaseModel):
     viewport_width: Optional[int] = Field(default=1280, description="Viewport width")
     viewport_height: Optional[int] = Field(default=720, description="Viewport height")
     headless: bool = Field(default=True, description="Headless browser flag")
+    live: bool = Field(default=False, description="Whether to execute directly against live target URL")
     timeout_ms: int = Field(default=10000, description="Timeout in milliseconds")
 
 
@@ -245,16 +266,24 @@ async def execute_workflow(
     req_width = 1280
     req_height = 720
     req_headless = True
+    req_live = False
 
     if isinstance(payload, ExecuteWorkflowRequest):
         if payload.viewport_width and payload.viewport_height:
             req_width = payload.viewport_width
             req_height = payload.viewport_height
         if payload.base_url:
-            req_base_url = validate_safe_url(payload.base_url)
+            req_base_url = await validate_safe_url(payload.base_url)
         req_headless = payload.headless
+        req_live = payload.live
         raw_params = payload.parameters if payload.parameters is not None else {}
-        typed_payload = ExecutionPayload(**raw_params)
+        try:
+            typed_payload = ExecutionPayload(**raw_params)
+        except ValidationError as val_exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=val_exc.errors(),
+            )
     elif isinstance(payload, ExecutionPayload):
         typed_payload = payload
         raw_dict = payload.model_dump()
@@ -262,7 +291,13 @@ async def execute_workflow(
         req_height = raw_dict.get("viewport_height", 720)
         req_headless = raw_dict.get("headless", True)
     else:
-        typed_payload = ExecutionPayload()
+        try:
+            typed_payload = ExecutionPayload()
+        except ValidationError as val_exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=val_exc.errors(),
+            )
 
     async with _execution_semaphore:
         req_driver = {{ workflow_class_name }}(
@@ -270,6 +305,7 @@ async def execute_workflow(
             viewport_width=req_width,
             viewport_height=req_height,
             headless=req_headless,
+            live=req_live,
         )
         try:
             result = await req_driver.execute_workflow(params=typed_payload.model_dump())
@@ -279,15 +315,32 @@ async def execute_workflow(
             response.headers["X-Execution-Latency-MS"] = str(latency_ms)
 
             steps = result.get("steps", [])
+            success_status = result.get("success", result.get("status") == "success")
+            err_msg = [result["error"]] if ("error" in result and not success_status) else None
             return ExecuteWorkflowResponse(
-                success=True,
+                success=success_status,
                 execution_id=execution_id,
                 workflow_name=WORKFLOW_NAME,
                 compile_hash=COMPILE_HASH,
                 latency_ms=latency_ms,
                 steps_executed=len(steps),
                 results=result,
-                errors=None,
+                errors=err_msg,
+            )
+        except Exception as exc:
+            latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+            response.headers["X-Ocular-Compile-Hash"] = COMPILE_HASH
+            response.headers["X-Execution-Latency-MS"] = str(latency_ms)
+
+            return ExecuteWorkflowResponse(
+                success=False,
+                execution_id=execution_id,
+                workflow_name=WORKFLOW_NAME,
+                compile_hash=COMPILE_HASH,
+                latency_ms=latency_ms,
+                steps_executed=0,
+                results={},
+                errors=[str(exc)],
             )
         except Exception as exc:
             latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
