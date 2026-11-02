@@ -332,8 +332,10 @@ def test_s06_origin_url_strictness_and_metadata(tmp_path: Path):
     start_url = "https://example.com:9000/auth/login?param=123"
     rec._write_session_metadata(start_url)
     meta = json.loads((rec_dir / "session_metadata.json").read_text(encoding="utf-8"))
-    assert meta["url"] == "https://example.com:9000"
-    assert "auth" not in meta["url"]
+    assert meta["origin"] == "https://example.com:9000"
+    assert "auth" not in meta["origin"]
+    assert "param" not in meta["origin"]
+    assert meta["url"] == "https://example.com:9000/auth/login"
     assert "param" not in meta["url"]
 
 

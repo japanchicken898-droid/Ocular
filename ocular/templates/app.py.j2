@@ -402,6 +402,7 @@ async def get_parameters_schema() -> Dict[str, Any]:
         "workflow": WORKFLOW_NAME,
         "compile_hash": COMPILE_HASH,
         "parameters_schema": schema_dict,
+        "parameters": schema_dict.get("properties", {}) or {},
         "input_parameters": clean_inputs,
         "anchors_count": len(WORKFLOW_DATA.get("anchors", {})),
         "zero_runtime_vision": True,
@@ -489,8 +490,24 @@ async def execute_workflow(
                 "success": False,
                 "error_code": "TIMEOUT",
                 "error": "Execution deadline exceeded",
+                "parameters": {},
                 "steps": [],
             }
+
+        raw_p = typed_payload.model_dump(by_alias=True) if typed_payload else {}
+        params_dict = result.get("parameters")
+        if not isinstance(params_dict, dict):
+            params_dict = {}
+        for pk, pv in raw_p.items():
+            if pk not in params_dict:
+                params_dict[pk] = pv
+        redacted_p = {}
+        for pk, pv in params_dict.items():
+            if _is_sensitive_identifier(pk):
+                redacted_p[pk] = "[REDACTED]"
+            else:
+                redacted_p[pk] = pv
+        result["parameters"] = redacted_p
 
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
         response.headers["X-Ocular-Compile-Hash"] = COMPILE_HASH

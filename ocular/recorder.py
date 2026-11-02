@@ -421,12 +421,16 @@ class OcularSessionRecorder:
 
     @staticmethod
     def _origin_only(url: str) -> str:
+        """Strict origin: {scheme}://{netloc} without userinfo, path, query, or fragment."""
+        if not url:
+            return ""
         try:
-            from urllib.parse import urlparse
-            p = urlparse(url.strip())
-            if p.scheme in ("http", "https") and p.hostname:
+            from urllib.parse import urlsplit
+            p = urlsplit(url.strip())
+            if p.scheme in ("http", "https") and p.netloc:
+                hostname = p.hostname.lower() if p.hostname else ""
                 port = f":{p.port}" if p.port and p.port not in (80, 443) else ""
-                return f"{p.scheme.lower()}://{p.hostname.lower()}{port}"
+                return f"{p.scheme.lower()}://{hostname}{port}"
         except Exception:
             pass
         return ""
@@ -434,6 +438,7 @@ class OcularSessionRecorder:
     def _write_session_metadata(self, url: str) -> None:
         start_epoch_ms = int(time.time() * 1000)
         sanitized = self._sanitize_origin(url)
+        origin = self._origin_only(url)
         import os
         os.makedirs(self.out_dir, mode=0o700, exist_ok=True)
         try:
@@ -450,7 +455,7 @@ class OcularSessionRecorder:
             with open(fd, "w", encoding="utf-8", closefd=True) as f:
                 f.write(json.dumps({
                     "url": sanitized,
-                    "origin": self._origin_only(url),
+                    "origin": origin,
                     "timestamp": time.time(),
                     "start_timestamp_ms": start_epoch_ms,
                 }))
