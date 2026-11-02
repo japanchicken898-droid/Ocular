@@ -23,9 +23,9 @@
 
 Traditional Multimodal Vision Agents are fragile, slow, and expensive. Taking screenshots, transmitting base64 payloads, and waiting for LLM spatial reasoning at runtime results in high latencies, stochastic hallucinations, and continuous API costs per action.
 
-**Ocular** shifts foundation models to compile-time. It digests human screen interactions and uses **Meta SAM 3.1** and **Meta Muse Spark** to synthesize a deterministic Directed Acyclic Graph (DAG)[cite: 8, 9]. It then emits a zero-runtime-inference Playwright execution driver wrapped in an authenticated FastAPI microservice[cite: 8].
+**Ocular** shifts foundation models to compile-time. It digests human screen interactions and uses **Meta SAM 3.1** and **Meta Muse Spark** to synthesize a deterministic Directed Acyclic Graph (DAG). It then emits a zero-runtime-inference Playwright execution driver wrapped in an authenticated FastAPI microservice.
 
-**The result: $0.00 runtime vision cost, sub-second deterministic execution, and complete isolation from runtime LLM dependencies[cite: 8, 9].**
+**The result: $0.00 runtime vision cost, sub-second deterministic execution, and complete isolation from runtime LLM dependencies.**
 
 ---
 
@@ -46,7 +46,7 @@ Autonomous tools risk data exfiltration and Server-Side Request Forgery (SSRF). 
 - Binds routes dynamically to FastAPI, exposing interactive schema documentation for authenticated workflow triggers.
 
 ### 4. Zero-Runtime Cost (ZRC)
-Because spatial segmentation and state-transition logic are computed once during compilation, the emitted microservice runs entirely offline via Playwright[cite: 8]. Zero runtime model inference means zero token egress and zero ongoing cost[cite: 8, 9].
+Because spatial segmentation and state-transition logic are computed once during compilation, the emitted microservice runs entirely offline via Playwright. Zero runtime model inference means zero token egress and zero ongoing cost.
 
 ---
 
@@ -128,14 +128,14 @@ playwright install chromium
 ```
 
 ### 2. Execute Pre-Compiled Workflow (Headed)
-Run the emitted Playwright driver directly against TradingView[cite: 8]:
+Run the emitted Playwright driver directly against TradingView:
 ```bash
 python dist_tradingview/playwright_driver.py --headed
 ```
-*The driver executes the compiled interaction, verifies postconditions, and outputs the telemetry card confirming `$0.00` runtime inference cost[cite: 8, 9].*
+*The driver executes the compiled interaction, verifies postconditions, and outputs the telemetry card confirming `$0.00` runtime inference cost.*
 
 ### 3. Launch the Emitted FastAPI Microservice
-Start the auto-generated, egress-guarded REST API server[cite: 8]:
+Start the auto-generated, egress-guarded REST API server:
 ```bash
 export OCULAR_ENABLE_DOCS=1
 export OCULAR_API_KEY="ocular-demo-key-2026"
@@ -148,25 +148,25 @@ uvicorn dist_tradingview.app:app --port 8000
 ## Recording & Compiling New Workflows
 
 ### 1. Record an Interactive Browser Session
-Launch the interactive session recorder targeting any web application[cite: 8]:
+Launch the interactive session recorder targeting any web application:
 ```bash
 ocular record --url "The website url"
 ```
 *An interactive browser window opens with client-side telemetry probes injected. Interact with the target application and close the browser window when finished. Ocular saves the high-resolution video and telemetry stream to `./recordings`.*
 
 ### 2. Compile a Visual Workflow
-Pass the recorded session into the Ocular compiler using Meta's vision stack[cite: 8, 9]:
+Pass the recorded session into the Ocular compiler using Meta's vision stack:
 ```bash
 export OCULAR_ALLOW_EXTERNAL_INFERENCE=1
 ocular compile -i recordings/ --output dist_tradingview
 ```
-*Meta SAM 3.1 resolves spatial segmentation across canvas and non-DOM boundaries, and Meta Muse Spark compiles verified state transitions into `dist_tradingview/`[cite: 8, 9].*
+*Meta SAM 3.1 resolves spatial segmentation across canvas and non-DOM boundaries, and Meta Muse Spark compiles verified state transitions into `dist_tradingview/`.*
 
 ---
 
 ## Confinement & Test Suite
 
-Ocular includes a 145-test confinement suite covering DAG synthesis, hybrid driver resilience, dynamic parameter injection, SSRF egress filtering, and secret redaction[cite: 6, 8].
+Ocular includes a 145-test confinement suite covering DAG synthesis, hybrid driver resilience, dynamic parameter injection, SSRF egress filtering, and secret redaction.
 
 ```bash
 pytest
