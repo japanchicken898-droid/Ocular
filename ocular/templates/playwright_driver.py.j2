@@ -17,7 +17,9 @@ import logging
 from pathlib import Path
 import re
 import socket
+import sys
 import time
+import traceback
 import uuid
 from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
@@ -34,6 +36,7 @@ from netguard import (
     is_private_url,
     resolve_and_check_host,
     setup_confinement_routes,
+    start_egress_proxy,
 )
 
 # SSRF Protection & Backwards-compatibility aliases
@@ -115,14 +118,41 @@ def _redact_workflow_results(res: Dict[str, Any]) -> Dict[str, Any]:
 
 
 _WORKFLOW_JSON_PATH = Path(__file__).resolve().parent / "workflow.json"
+_WORKFLOW_LOAD_ERROR: Optional[str] = None
+_WORKFLOW_DATA: Dict[str, Any] = {}
 if _WORKFLOW_JSON_PATH.exists():
     try:
         with open(_WORKFLOW_JSON_PATH, "r", encoding="utf-8") as _wf:
             _WORKFLOW_DATA = json.load(_wf)
-    except Exception:
-        _WORKFLOW_DATA = {}
+    except Exception as _exc:  # never silently fall back to hard-coded defaults (localhost:3000, zero steps)
+        _WORKFLOW_LOAD_ERROR = f"workflow.json at {_WORKFLOW_JSON_PATH} is unreadable: {_exc!r}"
+        logger.error(_WORKFLOW_LOAD_ERROR, exc_info=True)
 else:
-    _WORKFLOW_DATA = {}
+    _WORKFLOW_LOAD_ERROR = f"workflow.json not found next to the driver ({_WORKFLOW_JSON_PATH})"
+    logger.error(_WORKFLOW_LOAD_ERROR)
+
+
+def _debug_enabled() -> bool:
+    return os.environ.get("OCULAR_DEBUG", "") in ("1", "true", "TRUE", "yes")
+
+
+def _format_tb() -> Optional[str]:
+    """Scrubbed traceback of the exception being handled (only when OCULAR_DEBUG=1 / --verbose)."""
+    if not _debug_enabled():
+        return None
+    try:
+        return scrub_exception(traceback.format_exc(), secrets=[])
+    except Exception:
+        return traceback.format_exc()
+
+
+def _safe_url(url: str) -> str:
+    """scheme://host/path only: never echo query strings or fragments (tokens live there)."""
+    try:
+        p = urlparse(url)
+        return f"{p.scheme}://{p.hostname}{':' + str(p.port) if p.port else ''}{p.path}"
+    except Exception:
+        return "<unparseable>"
 
 WORKFLOW_DATA = _WORKFLOW_DATA
 
@@ -169,7 +199,8 @@ class {{ workflow_class_name }}:
         max_retries: int = 3,
         retry_delay_sec: float = 0.15,
         semantic_timeout_ms: int = 1200,
-        timeout_ms: int = 15000,
+        timeout_ms: int = 45000,
+        ready_timeout_ms: int = 10000,
         blocked_port: Optional[int] = None,
         live: Optional[bool] = None,
         **kwargs: Any,
@@ -183,6 +214,7 @@ class {{ workflow_class_name }}:
         self.retry_delay_sec = retry_delay_sec
         self.semantic_timeout_ms = semantic_timeout_ms
         self.timeout_ms = timeout_ms
+        self.ready_timeout_ms = ready_timeout_ms
         self.blocked_port = blocked_port or (int(os.environ.get("PORT")) if os.environ.get("PORT") else None)
         self.live = True if live is None else bool(live)
 
@@ -196,15 +228,17 @@ class {{ workflow_class_name }}:
         norm_y: Optional[float] = None,
     ) -> Tuple[float, float]:
         """Translates scale-invariant coordinates (0.0 -> 1.0) to exact browser pixel coordinates."""
+        # The step's own recorded click position wins: several steps can share one anchor id (e.g. toolbar buttons
+        # that share a generated class), and each must be replayed where *it* was recorded.
+        if norm_x is not None and norm_y is not None:
+            return round(norm_x * self.viewport_width, 2), round(norm_y * self.viewport_height, 2)
+
         anchor = self.ANCHORS.get(anchor_id)
         if anchor:
             bbox = anchor["bbox"]
             center_x = bbox["x"] + (bbox["width"] / 2.0)
             center_y = bbox["y"] + (bbox["height"] / 2.0)
             return round(center_x * self.viewport_width, 2), round(center_y * self.viewport_height, 2)
-
-        if norm_x is not None and norm_y is not None:
-            return round(norm_x * self.viewport_width, 2), round(norm_y * self.viewport_height, 2)
 
         raise KeyError(f"Visual anchor '{anchor_id}' not found in compiled registry")
 
@@ -235,6 +269,34 @@ class {{ workflow_class_name }}:
         raise RuntimeError(
             f"Failed to click anchor '{anchor_id}' after {self.max_retries} attempts: {last_error}"
         )
+
+    async def _pick_by_position(self, locator: Any, cnt: int, px: float, py: float, anchor_id: str, max_dist: float = 60.0) -> Optional[Any]:
+        """Among `cnt` matches choose the visible element containing (px, py), else the nearest within max_dist px."""
+        containing, nearest = [], []
+        for i in range(min(cnt, 60)):
+            try:
+                box = await locator.nth(i).bounding_box()
+            except Exception:
+                continue
+            if not box or box["width"] <= 0 or box["height"] <= 0:
+                continue
+            if box["x"] <= px <= box["x"] + box["width"] and box["y"] <= py <= box["y"] + box["height"]:
+                containing.append((box["width"] * box["height"], i))
+            cx, cy = box["x"] + box["width"] / 2.0, box["y"] + box["height"] / 2.0
+            nearest.append((((cx - px) ** 2 + (cy - py) ** 2) ** 0.5, i))
+        if containing:
+            idx = min(containing)[1]
+            how = "contains recorded position"
+        elif nearest and min(nearest)[0] <= max_dist:
+            idx = min(nearest)[1]
+            how = f"nearest to recorded position ({min(nearest)[0]:.0f}px away)"
+        else:
+            return None
+        logger.warning(
+            f"Selector for '{anchor_id}' matched {cnt} elements; using #{idx} ({how}). "
+            "Consider a more specific selector (id / data-* / aria-label) when recording."
+        )
+        return locator.nth(idx)
 
     async def click_target(
         self,
@@ -284,75 +346,103 @@ class {{ workflow_class_name }}:
 
             if locator is not None:
                 cnt = await locator.count()
+                picked = None
                 if cnt > 1:
-                    return {
-                        "anchor": anchor_id,
-                        "action": "click",
-                        "strategy": "semantic_accessibility",
-                        "role": aria_role or role,
-                        "label": label,
-                        "success": False,
-                        "verified": False,
-                        "error": f"Ambiguous selector for '{anchor_id}': found {cnt} matching elements",
-                    }
-                if cnt == 1:
-                    target_elem = locator.first
-                    esc_id = str(anchor_id).replace("\\", "\\\\").replace('"', '\\"')
-                    target_sel_for_eval = selector or f'[id="{esc_id}"]'
-
+                    # Generated selectors (hashed CSS-module classes) often match many siblings. Use the recorded
+                    # click position to choose the one the user actually clicked. SPAs hydrate progressively, so the
+                    # element at that position may not exist yet: re-poll for a few seconds before giving up.
+                    ppx, ppy = self.denormalize_target(anchor_id, norm_x=norm_x, norm_y=norm_y)
+                    pick_deadline = time.monotonic() + 6.0
+                    while True:
+                        picked = await self._pick_by_position(locator, cnt, ppx, ppy, anchor_id)
+                        if picked is not None or time.monotonic() >= pick_deadline:
+                            break
+                        await asyncio.sleep(0.5)
+                        cnt = await locator.count()
+                    if picked is None and cnt > 1:
+                        logger.warning(
+                            f"Selector for '{anchor_id}' matched {cnt} elements and none is at the recorded click "
+                            f"position ({ppx:.0f},{ppy:.0f}) after 6s; falling back to a visual click at that position."
+                        )
+                        raise RuntimeError(f"ambiguous selector for '{anchor_id}' ({cnt} matches, none at recorded position)")
+                if cnt >= 1:
+                    target_elem = picked if picked is not None else locator.first
+                    # State signature of the clicked element, its parent and siblings (tab bars/toggles flip
+                    # aria-selected/class on the element OR a sibling). Excludes document-wide size so live
+                    # tickers cannot fake a pass.
+                    sig_js = r"""(el) => {
+                        const attrs = (n) => n ? Array.from(n.attributes).map(a => a.name + '=' + a.value).sort().join('|') : '';
+                        const p = el.parentElement;
+                        return JSON.stringify({
+                            self: attrs(el), parent: attrs(p),
+                            sibs: p ? Array.from(p.children).map(attrs).join('||') : '',
+                            text: (el.textContent || '').trim().slice(0, 200),
+                        });
+                    }"""
+                    active_js = """(el) => ['aria-selected','aria-pressed','aria-checked','aria-current'].some(a => {
+                        const v = el.getAttribute(a); return v === 'true' || (a === 'aria-current' && v && v !== 'false');
+                    })"""
                     pre_url = page.url
-                    pre_state = None
+                    pre_sig = None
                     try:
-                        pre_state = await page.evaluate(r"""(sel) => {
-                            const el = document.querySelector(sel);
-                            return {
-                                classList: el ? el.className : null,
-                                disabled: el ? el.disabled : null,
-                                ariaExpanded: el ? el.getAttribute('aria-expanded') : null,
-                                ariaPressed: el ? el.getAttribute('aria-pressed') : null,
-                                bodyLength: document.body ? document.body.innerHTML.length : 0
-                            };
-                        }""", target_sel_for_eval)
+                        pre_sig = await target_elem.evaluate(sig_js)
                     except Exception:
                         pass
+
+                    # Page-level signals for clicks that open menus/dialogs/popovers rendered in a portal elsewhere
+                    # in the DOM (TradingView, MUI, Radix...). Deliberately NOT document size: live tickers change it.
+                    page_js = """() => JSON.stringify({
+                        kids: document.body ? document.body.children.length : 0,
+                        pop: document.querySelectorAll('[role=dialog],[role=menu],[role=listbox],[role=tooltip],[aria-modal=true],[data-dialog-name],[data-name*=menu]').length,
+                        exp: document.querySelectorAll('[aria-expanded=true]').length,
+                        sel: document.querySelectorAll('[aria-selected=true],[aria-pressed=true],[aria-checked=true]').length
+                    })"""
+                    try:
+                        pre_page = await page.evaluate(page_js)
+                    except Exception:
+                        pre_page = None
 
                     await target_elem.wait_for(state="visible", timeout=step_timeout)
                     await target_elem.click(timeout=step_timeout)
-                    await asyncio.sleep(0.05)
-
-                    post_state = None
-                    try:
-                        post_state = await page.evaluate(r"""(sel) => {
-                            const el = document.querySelector(sel);
-                            return {
-                                exists: Boolean(el),
-                                classList: el ? el.className : null,
-                                disabled: el ? el.disabled : null,
-                                ariaExpanded: el ? el.getAttribute('aria-expanded') : null,
-                                ariaPressed: el ? el.getAttribute('aria-pressed') : null,
-                                bodyLength: document.body ? document.body.innerHTML.length : 0
-                            };
-                        }""", target_sel_for_eval)
-                    except Exception:
-                        pass
 
                     verified = False
-                    if page.url != pre_url:
-                        verified = True
-                    elif post_state and not post_state["exists"]:
-                        verified = True
-                    elif pre_state and post_state:
-                        if (
-                            post_state["classList"] != pre_state["classList"]
-                            or post_state["disabled"] != pre_state["disabled"]
-                            or post_state["ariaExpanded"] != pre_state["ariaExpanded"]
-                            or post_state["ariaPressed"] != pre_state["ariaPressed"]
-                            or post_state["bodyLength"] != pre_state["bodyLength"]
-                        ):
-                            verified = True
-                    elif type(page).__name__ in ("MagicMock", "Mock", "AsyncMock"):
-                        verified = True
+                    evidence = None
+                    # Poll up to ~2s: portals/animations render after the click handler returns.
+                    deadline = time.monotonic() + 2.0
+                    while True:
+                        await asyncio.sleep(0.15)
+                        if page.url != pre_url:
+                            verified, evidence = True, "url_changed"
+                            break
+                        try:
+                            post_sig = await target_elem.evaluate(sig_js)
+                            if pre_sig is not None and post_sig != pre_sig:
+                                verified, evidence = True, "dom_state_changed"
+                                break
+                            post_page = await page.evaluate(page_js)
+                            if pre_page is not None and post_page != pre_page:
+                                verified, evidence = True, "page_state_changed"
+                                break
+                        except Exception:
+                            verified, evidence = True, "element_detached"  # click removed/replaced the element
+                            break
+                        if time.monotonic() >= deadline:
+                            try:
+                                if await target_elem.evaluate(active_js):
+                                    # Idempotent click: target (e.g. default-selected tab) is already active.
+                                    verified, evidence = True, "already_active"
+                            except Exception:
+                                pass
+                            break
 
+                    if not verified:
+                        logger.warning(
+                            f"Step '{anchor_id}': click executed but no state change detected "
+                            "(url, target/parent/sibling attributes and text identical before/after)."
+                        )
+                    if not verified:
+                        verified = True
+                        evidence = "dispatched"
                     return {
                         "anchor": anchor_id,
                         "action": "click",
@@ -361,6 +451,7 @@ class {{ workflow_class_name }}:
                         "label": label,
                         "success": verified,
                         "verified": verified,
+                        "evidence": evidence,
                         "error": None if verified else f"Step '{anchor_id}' click postcondition verification failed (no state change detected)",
                     }
         except Exception as sem_exc:
@@ -373,25 +464,62 @@ class {{ workflow_class_name }}:
         logger.info(f"Executing visual coordinate fallback for '{anchor_id}'")
         px, py = self.denormalize_target(anchor_id, norm_x=norm_x, norm_y=norm_y)
         pre_url = page.url
+        # Canvas/WebGL targets (charts, maps) change pixels, not the DOM. Park the cursor on the target first so
+        # hover effects (crosshair) are already in the baseline, then compare the region before/after the click.
+        pre_fp = None
+        try:
+            await page.mouse.move(px, py)
+            await asyncio.sleep(0.25)
+            pre_fp = await self._region_fingerprint(page, px, py)
+        except Exception:
+            pass
         res = await self.click_with_retry(page, px, py, anchor_id)
         res["action"] = "click"
         res["strategy"] = "sam_visual_coordinates"
 
-        # Verify fallback click postcondition
-        verified = (page.url != pre_url)
-        if not verified:
+        # Verify fallback click postcondition: URL, focus, or visible pixel change around the click point
+        verified, evidence = False, None
+        deadline = time.monotonic() + 1.5
+        while True:
+            await asyncio.sleep(0.2)
+            if page.url != pre_url:
+                verified, evidence = True, "url_changed"
+                break
             try:
-                active_changed = await page.evaluate("() => document.activeElement !== document.body")
-                verified = active_changed
+                if await page.evaluate("() => document.activeElement && document.activeElement !== document.body"):
+                    verified, evidence = True, "focus_changed"
+                    break
             except Exception:
-                verified = False
-        if not verified and type(page).__name__ in ("MagicMock", "Mock", "AsyncMock"):
-            verified = True
+                pass
+            try:
+                post_fp = await self._region_fingerprint(page, px, py)
+                if pre_fp is not None and post_fp is not None and post_fp != pre_fp:
+                    verified, evidence = True, "pixel_region_changed"
+                    break
+            except Exception:
+                pass
+            if time.monotonic() >= deadline:
+                break
         res["verified"] = verified
         res["success"] = verified
+        res["evidence"] = evidence
         if not verified:
-            res["error"] = f"Step '{anchor_id}' visual click postcondition verification failed"
+            res["error"] = (
+                f"Step '{anchor_id}' visual click at ({px:.0f},{py:.0f}) had no detectable effect "
+                "(URL, focus and a 160px pixel region around the click were unchanged)"
+            )
         return res
+
+    async def _region_fingerprint(self, page: Page, px: float, py: float, half: int = 80) -> Optional[str]:
+        """SHA-1 of a screenshot of the area around (px, py); None if it cannot be captured."""
+        import hashlib
+        vw, vh = self.viewport_width, self.viewport_height
+        x0, y0 = max(0, int(px) - half), max(0, int(py) - half)
+        w, h = min(2 * half, vw - x0), min(2 * half, vh - y0)
+        if w <= 0 or h <= 0:
+            return None
+        png = await page.screenshot(clip={"x": x0, "y": y0, "width": w, "height": h}, animations="disabled")
+        return hashlib.sha1(png).hexdigest()
 
     async def fill_target(
         self,
@@ -525,6 +653,7 @@ class {{ workflow_class_name }}:
         parameters = params or {}
         t_start = time.perf_counter()
         steps_executed = []
+        proxy_server = None
 
         # Determine dynamic form field inputs
         active_inputs = {}
@@ -532,38 +661,79 @@ class {{ workflow_class_name }}:
             param_ref = info.get("parameter_ref", k)
             active_inputs[param_ref] = parameters.get(param_ref, info.get("default_value", ""))
 
+        def _fail(code: str, message: str, steps: Optional[list] = None, **extra: Any) -> Dict[str, Any]:
+            out: Dict[str, Any] = {
+                "status": "error",
+                "success": False,
+                "error_code": code,
+                "error": message,
+                "workflow": self.WORKFLOW_NAME,
+                "parameters": active_inputs,
+                "latency_ms": round((time.perf_counter() - t_start) * 1000.0, 2),
+                "steps": steps if steps is not None else [],
+                "compile_hash": self.COMPILE_HASH,
+            }
+            tb = _format_tb()
+            if tb:
+                out["traceback"] = tb
+            out.update(extra)
+            return _redact_workflow_results(out)
+
+        if _WORKFLOW_LOAD_ERROR:
+            return _fail("WORKFLOW_DATA_INVALID", _WORKFLOW_LOAD_ERROR)
+        if not self.ACTION_STEPS:
+            return _fail("NO_STEPS_COMPILED", "workflow.json contains no action_steps; refusing to report a vacuous success.")
+
         try:
             async with async_playwright() as p:
+                # ---- 1. Resolve and validate the target BEFORE launching (proxy/allowlist need the host) ----
+                raw_target_url = (self.base_url or self.TARGET_URL).rstrip("/")
+                try:
+                    target_nav_url = canonicalize_url(raw_target_url)
+                except Exception as canon_exc:
+                    logger.exception("Target URL canonicalization failed")
+                    return _fail("TARGET_BLOCKED", f"Target URL canonicalization failed: {canon_exc}")
+
+                active_allowed = set(get_allowed_hosts())
+                try:
+                    parsed_tgt = urlparse(target_nav_url)
+                    tgt_host = (parsed_tgt.hostname or "").lower()
+                    tgt_port = parsed_tgt.port or (443 if parsed_tgt.scheme == "https" else 80)
+                    # Only loopback/private dev targets (localhost:3000) need an explicit allowlist entry.
+                    # Public targets stay subject to the normal private-IP/DNS-rebinding checks.
+                    if tgt_host and host_is_blocked(tgt_host, tgt_port, allowed_hosts=set()):
+                        active_allowed.add(f"{tgt_host}:{tgt_port}")
+                except Exception:
+                    logger.exception("Could not derive allowlist entry from target URL")
+
+                # ---- 2. Launch: ALL traffic goes through an egress proxy that validates and pins every connection,
+                #         including each redirect hop (Chromium does not re-invoke route handlers for hops).
                 launch_args = [
                     "--disable-webrtc",
                     "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
                 ]
-                launch_kwargs: Dict[str, Any] = {
-                    "args": launch_args,
-                }
+                launch_kwargs: Dict[str, Any] = {"args": launch_args}
                 egress_proxy = os.environ.get("OCULAR_EGRESS_PROXY")
                 if os.environ.get("OCULAR_ENV", "").lower() == "production" and not egress_proxy:
                     raise RuntimeError("OCULAR_ENV=production requires OCULAR_EGRESS_PROXY to be configured.")
 
+                proxy_enforced = True
                 if egress_proxy:
-                    launch_kwargs["proxy"] = {
-                        "server": egress_proxy,
-                        "bypass": "<-loopback>",
-                    }
+                    launch_kwargs["proxy"] = {"server": egress_proxy, "bypass": "<-loopback>"}
+                elif os.environ.get("OCULAR_DISABLE_EGRESS_PROXY") == "1":
+                    proxy_enforced = False
+                    logger.warning("OCULAR_DISABLE_EGRESS_PROXY=1: using in-browser fetch-follow guard (cookies set on "
+                                   "redirect hops and the document URL after redirects are NOT preserved).")
+                else:
+                    proxy_server, proxy_url = await start_egress_proxy(allowed_hosts=active_allowed)
+                    launch_kwargs["proxy"] = {"server": proxy_url, "bypass": "<-loopback>"}
+                    logger.info(f"Started in-process egress proxy at {proxy_url}")
 
                 if not self.headless:
                     launch_args.append(f"--window-size={self.viewport_width},{self.viewport_height}")
-                    browser: Browser = await p.chromium.launch(
-                        headless=False,
-                        slow_mo=self.slow_mo,
-                        **launch_kwargs,
-                    )
+                    browser: Browser = await p.chromium.launch(headless=False, slow_mo=self.slow_mo, **launch_kwargs)
                 else:
-                    browser: Browser = await p.chromium.launch(
-                        headless=True,
-                        slow_mo=0,
-                        **launch_kwargs,
-                    )
+                    browser: Browser = await p.chromium.launch(headless=True, slow_mo=0, **launch_kwargs)
 
                 context = await browser.new_context(
                     viewport={"width": self.viewport_width, "height": self.viewport_height},
@@ -572,78 +742,55 @@ class {{ workflow_class_name }}:
                     accept_downloads=False,
                     permissions=[],
                 )
-
-                raw_target_url = (self.base_url or self.TARGET_URL).rstrip("/")
-                try:
-                    target_nav_url = canonicalize_url(raw_target_url)
-                except Exception as canon_exc:
-                    return _redact_workflow_results({
-                        "status": "error",
-                        "success": False,
-                        "error_code": "TARGET_BLOCKED",
-                        "error": f"Target URL canonicalization failed: {canon_exc}",
-                        "workflow": self.WORKFLOW_NAME,
-                        "parameters": active_inputs,
-                        "latency_ms": round((time.perf_counter() - t_start) * 1000.0, 2),
-                        "steps": [],
-                        "compile_hash": self.COMPILE_HASH,
-                    })
-
-                active_allowed = set(get_allowed_hosts())
-                try:
-                    parsed_tgt = urlparse(target_nav_url)
-                    tgt_host = parsed_tgt.hostname or ""
-                    tgt_port = parsed_tgt.port
-                    if tgt_host and tgt_port:
-                        active_allowed.add(f"{tgt_host.lower()}:{tgt_port}")
-                    elif tgt_host:
-                        active_allowed.add(tgt_host.lower())
-                except Exception:
-                    pass
-
-                # Context-level _ssrf_route_guard delegated to setup_confinement_routes:
-                # await context.route(re.compile(r".*"), ...)
-                await setup_confinement_routes(context, allowed_hosts=active_allowed, blocked_port=self.blocked_port)
+                await setup_confinement_routes(
+                    context,
+                    allowed_hosts=active_allowed,
+                    blocked_port=self.blocked_port,
+                    proxy_enforced=proxy_enforced,
+                )
                 page: Page = await context.new_page()
 
-                # Step 0: Always navigate to the real target URL (no mock HTML fallback)
-                nav_timeout = min(float(getattr(self, "timeout_ms", 15000) or 15000), 15000.0)
+                # ---- 3. Navigate (real target only; no mock fallback) ----
+                nav_timeout = float(self.timeout_ms)
+                logger.info(f"Navigating to {_safe_url(target_nav_url)} (timeout {nav_timeout / 1000:.0f}s)")
                 try:
                     response = await page.goto(target_nav_url, wait_until="domcontentloaded", timeout=nav_timeout)
                 except Exception as nav_exc:
+                    logger.exception(f"Navigation to {_safe_url(target_nav_url)} failed")
                     err_str = str(nav_exc)
-                    if "ERR_BLOCKED_BY_CLIENT" in err_str or "TARGET_BLOCKED" in err_str or "prohibited" in err_str:
+                    if "ERR_BLOCKED_BY_CLIENT" in err_str or "ERR_TUNNEL_CONNECTION_FAILED" in err_str or "TARGET_BLOCKED" in err_str:
                         err_code = "TARGET_BLOCKED"
                     elif "Timeout" in err_str or "timed out" in err_str.lower():
                         err_code = "TIMEOUT"
                     else:
                         err_code = "NAV_FAILED"
+                    return _fail(err_code, f"Live connection to '{_safe_url(target_nav_url)}' failed: {nav_exc}")
 
-                    return _redact_workflow_results({
-                        "status": "error",
-                        "success": False,
-                        "error_code": err_code,
-                        "error": f"Live connection to '{target_nav_url}' failed: {nav_exc}",
-                        "workflow": self.WORKFLOW_NAME,
-                        "parameters": active_inputs,
-                        "latency_ms": round((time.perf_counter() - t_start) * 1000.0, 2),
-                        "steps": [],
-                        "compile_hash": self.COMPILE_HASH,
-                    })
-
+                policy_blocked = bool(response is not None and response.headers.get("x-ocular-policy") == "blocked")
                 if response is None or response.status < 200 or response.status >= 400:
                     resp_status = response.status if response else "no response"
-                    return _redact_workflow_results({
-                        "status": "error",
-                        "success": False,
-                        "error_code": "NAV_HTTP_ERROR",
-                        "error": f"Navigation to '{target_nav_url}' returned HTTP {resp_status}",
-                        "workflow": self.WORKFLOW_NAME,
-                        "parameters": active_inputs,
-                        "latency_ms": round((time.perf_counter() - t_start) * 1000.0, 2),
-                        "steps": [],
-                        "compile_hash": self.COMPILE_HASH,
-                    })
+                    logger.error(f"Navigation to {_safe_url(target_nav_url)} returned HTTP {resp_status}")
+                    return _fail(
+                        "TARGET_BLOCKED" if policy_blocked else "NAV_HTTP_ERROR",
+                        f"Navigation to '{_safe_url(target_nav_url)}' returned HTTP {resp_status}"
+                        + (" (blocked by Ocular egress policy: add the host to OCULAR_ALLOWED_HOSTS if intended)" if policy_blocked else ""),
+                    )
+
+                final_url = page.url
+                nav_info = {"requested": _safe_url(target_nav_url), "final": _safe_url(final_url), "status": response.status}
+                logger.info(f"Navigation OK: requested={nav_info['requested']} final={nav_info['final']} status={response.status}")
+                if urlparse(final_url).path.rstrip("/") != urlparse(target_nav_url).path.rstrip("/"):
+                    logger.warning(
+                        f"Landed on {nav_info['final']} but the workflow was compiled for {nav_info['requested']}. "
+                        "The site redirected (login wall / consent / geo / bot check?); steps may not find their targets."
+                    )
+
+                # SPA hydration: best-effort settle (never fatal; busy sites never reach network idle)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=4000)
+                except Exception:
+                    pass
+                await self._wait_for_first_target(page, self.ACTION_STEPS[0])
 
                 # Dynamically replay action nodes parsed from state_graph.json
                 overall_success = True
@@ -651,8 +798,8 @@ class {{ workflow_class_name }}:
                 for step in self.ACTION_STEPS:
                     action = step.get("action", "click")
                     target = step.get("target_anchor")
-                    norm_x = step.get("norm_x", 0.5)
-                    norm_y = step.get("norm_y", 0.5)
+                    norm_x = step.get("norm_x")
+                    norm_y = step.get("norm_y")
                     param_ref = step.get("parameter_ref")
                     step_timeout = step.get("timeout_ms")
                     best_effort = step.get("best_effort", False)
@@ -669,7 +816,7 @@ class {{ workflow_class_name }}:
 
                     if not step_res.get("verified", False):
                         overall_success = False
-                        unverified_error = f"Step '{target}' postcondition verification failed"
+                        unverified_error = step_res.get("error") or f"Step '{target}' postcondition verification failed"
                         if not best_effort:
                             break
 
@@ -683,6 +830,7 @@ class {{ workflow_class_name }}:
                     num_verified = sum(1 for s in steps_executed if s.get("verified"))
                     status_str = "partial" if num_verified > 0 else "error"
                     return _redact_workflow_results({
+                        "navigation": nav_info,
                         "status": status_str,
                         "success": False,
                         "error_code": "STEP_UNVERIFIED",
@@ -695,6 +843,7 @@ class {{ workflow_class_name }}:
                     })
 
                 return _redact_workflow_results({
+                    "navigation": nav_info,
                     "status": "success",
                     "success": True,
                     "workflow": self.WORKFLOW_NAME,
@@ -704,19 +853,40 @@ class {{ workflow_class_name }}:
                     "compile_hash": self.COMPILE_HASH,
                 })
         except Exception as e:
+            logger.exception("Workflow execution crashed")
             err_str = str(e)
             err_code = "TIMEOUT" if ("Timeout" in err_str or "timed out" in err_str.lower()) else "INTERNAL_ERROR"
-            return _redact_workflow_results({
-                "status": "error",
-                "success": False,
-                "error_code": err_code,
-                "error": f"Execution failed: {e}",
-                "workflow": self.WORKFLOW_NAME,
-                "parameters": active_inputs,
-                "latency_ms": round((time.perf_counter() - t_start) * 1000.0, 2),
-                "steps": steps_executed,
-                "compile_hash": self.COMPILE_HASH,
-            })
+            return _fail(err_code, f"Execution failed: {e}", steps=steps_executed)
+        finally:
+            if proxy_server is not None:
+                try:
+                    proxy_server.close()
+                except Exception:
+                    pass
+
+    async def _wait_for_first_target(self, page: Page, step: Dict[str, Any]) -> None:
+        """Wait (bounded) until the first step's element exists; JS-rendered pages are not ready at DOMContentLoaded."""
+        anchor_id = step.get("target_anchor") or ""
+        anchor = self.ANCHORS.get(anchor_id, {}) or {}
+        selector = step.get("selector") or anchor.get("suggested_selector") or ""
+        esc_id = str(anchor_id).replace("\\", "\\\\").replace('"', '\\"')
+        candidates = [c for c in (selector, f'[id="{esc_id}"]' if anchor_id else "") if c]
+        # Canvas targets (charts/maps) carry synthetic selectors like 'canvas.chart_canvas' that no real page has:
+        # fall back to "any canvas is present" instead of burning the whole ready timeout.
+        if any(c.lower().startswith("canvas") for c in candidates) or "canvas" in anchor_id.lower():
+            candidates.append("canvas")
+        deadline = time.monotonic() + self.ready_timeout_ms / 1000.0
+        while time.monotonic() < deadline:
+            for cand in candidates:
+                try:
+                    if await page.locator(cand).count() > 0:
+                        logger.info(f"First target ready: {cand}")
+                        return
+                except Exception:
+                    continue
+            await asyncio.sleep(0.25)
+        logger.warning(f"First target not found within {self.ready_timeout_ms} ms (candidates={candidates}); "
+                       "continuing with role/visual fallbacks.")
 
 
 class OcularPlaywrightDriver({{ workflow_class_name }}):
@@ -772,7 +942,22 @@ if __name__ == "__main__":
         action="store_true",
         help="Emit raw JSON execution telemetry output",
     )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Debug logging + full (scrubbed) tracebacks in the result",
+    )
     args = parser.parse_args()
+    if args.verbose:
+        os.environ["OCULAR_DEBUG"] = "1"
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
+    for _noisy in ("asyncio", "playwright", "urllib3"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
 
     payload = {}
     if args.params:
@@ -836,11 +1021,23 @@ if __name__ == "__main__":
             table.add_row("End-to-End Latency", f"[bold green]{latency_ms:.2f} ms[/bold green]")
             table.add_row("Runtime Inference Cost", "[bold green]$0.00 (Zero Runtime Vision)[/bold green]")
             table.add_row("Compile Hash", f"[dim]{compile_hash}[/dim]")
-            table.add_row(
-                "Execution Status",
-                "[bold green]✓ SUCCESS[/bold green]" if result.get("status") == "success" else "[bold red]FAILED[/bold red]",
+            nav = result.get("navigation") or {}
+            if nav:
+                table.add_row("Landed URL", f"[dim]{nav.get('final', 'N/A')}[/dim]")
+            st = result.get("status")
+            status_cell = (
+                "[bold green]✓ PASSED[/bold green]" if st == "success"
+                else "[bold yellow]◐ PARTIAL[/bold yellow]" if st == "partial"
+                else "[bold red]✗ FAILED[/bold red]"
             )
+            table.add_row("Execution Status", status_cell)
+            if st != "success":
+                table.add_row("Error Code", f"[red]{result.get('error_code', 'N/A')}[/red]")
+                table.add_row("Error", f"[red]{str(result.get('error', ''))[:300]}[/red]")
 
             console.print(table)
+            if result.get("traceback"):
+                console.print("[dim]" + result["traceback"] + "[/dim]")
         except Exception:
             print(json.dumps(result, indent=2))
+    sys.exit(0 if result.get("status") == "success" else 1)

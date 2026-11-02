@@ -152,8 +152,8 @@ class TTLLRUCache:
 _DNS_CACHE = TTLLRUCache(maxsize=1024, default_ttl=5.0)
 
 # Dedicated bounded thread executor and concurrency semaphore for DNS resolutions
-_DNS_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="netguard_dns")
-_DNS_SEMAPHORE = asyncio.Semaphore(8)
+_DNS_EXECUTOR = ThreadPoolExecutor(max_workers=16, thread_name_prefix="netguard_dns")
+_DNS_SEMAPHORE = asyncio.Semaphore(16)
 
 
 def parse_legacy_ipv4(s: str) -> Optional[ipaddress.IPv4Address]:
@@ -508,6 +508,9 @@ async def resolve_safe_ip(
                 pass
         if parsed_ip is not None:
             return str(parsed_ip)
+        # Operator explicitly allowlisted this *hostname* (e.g. 'localhost:3000'): trust what it resolves to.
+        # Previously the resolved 127.0.0.1 was re-checked and blocked.
+        return clean_host
 
     # Check if clean_host is already an IP address
     parsed_ip = parse_legacy_ipv4(clean_host)
@@ -552,7 +555,7 @@ async def resolve_safe_ip(
                         socket.SOCK_STREAM,
                         socket.IPPROTO_TCP,
                     ),
-                    timeout=2.0,
+                    timeout=5.0,
                 )
 
         if not addr_info:
@@ -577,8 +580,8 @@ async def resolve_safe_ip(
         _DNS_CACHE.set(cache_key, "", ttl=2.0)
         return None
     except Exception as exc:
-        logger.debug(f"DNS resolution failure for '{clean_host}': {exc}; failing closed with 2s TTL.")
-        _DNS_CACHE.set(cache_key, "", ttl=2.0)
+        logger.warning(f"DNS resolution failure for '{clean_host}': {exc!r}; failing closed (retry allowed after 1s).")
+        _DNS_CACHE.set(cache_key, "", ttl=1.0)
         return None
 
 
@@ -601,7 +604,7 @@ async def resolve_and_check_host(
     return safe_ip is None
 
 
-MAX_REDIRECTS = 5
+MAX_REDIRECTS = 10
 MAX_RESPONSE_BYTES = 25 * 1024 * 1024  # 25 MB
 MAX_WALL_TIME_SEC = 20.0
 
@@ -610,8 +613,15 @@ async def setup_confinement_routes(
     context: Any,
     allowed_hosts: Optional[Set[str]] = None,
     blocked_port: Optional[int] = None,
+    proxy_enforced: bool = False,
 ) -> None:
-    """Configures Playwright BrowserContext with comprehensive SSRF route and WebSocket guards."""
+    """Configures Playwright BrowserContext with comprehensive SSRF route and WebSocket guards.
+
+    proxy_enforced=True: all browser traffic goes through start_egress_proxy() (or an operator proxy) which validates
+    and pins every connection incl. each redirect hop; the route guard then only fast-fails obvious violations.
+    NOTE: route.continue_() WITHOUT such a proxy is NOT safe: Chromium does not re-invoke route handlers for
+    redirect hops (verified empirically).
+    """
     active_allowlist = allowed_hosts if allowed_hosts is not None else get_allowed_hosts()
 
     async def _http_route_guard(route: Any) -> None:
@@ -667,14 +677,22 @@ async def setup_confinement_routes(
 
                 # 5. Fetch with max_redirects=0
                 fetch_kwargs: Dict[str, Any] = {"max_redirects": 0}
+                if proxy_enforced:
+                    # The egress proxy validates + pins every connection (each redirect hop). Let Chromium do the
+                    # request itself: keeps page.url, cookies set on hops, relative URLs and Chrome's TLS fingerprint.
+                    await route.continue_()
+                    return
                 if hop == 0:
                     resp = await route.fetch(**fetch_kwargs)
                 else:
+                    hop_headers = {k: v for k, v in current_headers.items() if k.lower() not in ("host", "content-length")}
+                    if urlparse(current_url).netloc != urlparse(req_url).netloc:
+                        hop_headers = {k: v for k, v in hop_headers.items() if k.lower() not in ("authorization", "cookie")}
                     resp = await route.fetch(
                         url=current_url,
                         method=current_method,
-                        headers=current_headers,
-                        data=current_post_data,
+                        headers=hop_headers,
+                        post_data=current_post_data,
                         **fetch_kwargs,
                     )
 
@@ -746,7 +764,7 @@ async def setup_confinement_routes(
                 abort_code = "blockedbyclient"
             else:
                 abort_code = "connectionfailed"
-            logger.debug(f"Error in _http_route_guard: {exc}; aborting route with {abort_code}.")
+            logger.warning(f"Error in _http_route_guard for {route.request.url}: {exc!r}; aborting route with {abort_code}.", exc_info=True)
             await route.abort(abort_code)
 
     async def _ws_route_guard(ws_route: Any) -> None:
@@ -844,7 +862,7 @@ async def start_egress_proxy(
                     custom_resolver=custom_resolver,
                 )
                 if not resolved_ip:
-                    writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n\r\nSSRF Policy Blocked\r\n")
+                    writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nX-Ocular-Policy: blocked\r\nConnection: close\r\n\r\nSSRF Policy Blocked\r\n")
                     await writer.drain()
                     writer.close()
                     await writer.wait_closed()
@@ -905,7 +923,7 @@ async def start_egress_proxy(
                     custom_resolver=custom_resolver,
                 )
                 if not resolved_ip:
-                    writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n\r\nSSRF Policy Blocked\r\n")
+                    writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nX-Ocular-Policy: blocked\r\nConnection: close\r\n\r\nSSRF Policy Blocked\r\n")
                     await writer.drain()
                     writer.close()
                     await writer.wait_closed()
@@ -923,7 +941,20 @@ async def start_egress_proxy(
                     await writer.wait_closed()
                     return
 
-                upstream_writer.write(b"".join(headers))
+                # Rewrite absolute-form request line (GET http://h/p HTTP/1.1) to origin-form (GET /p HTTP/1.1) and force
+                # one request per client connection (a reused keep-alive connection could otherwise carry a 2nd host
+                # to the 1st upstream without validation).
+                req_parts = headers[0].decode("latin1", errors="replace").strip().split()
+                version = req_parts[2] if len(req_parts) > 2 else "HTTP/1.1"
+                origin_form = (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else "")
+                cleaned = [f"{method} {origin_form} {version}\r\n".encode("latin1", errors="replace")]
+                for hl in headers[1:]:
+                    name = hl.split(b":", 1)[0].strip().lower()
+                    if name in (b"connection", b"proxy-connection", b"keep-alive", b"proxy-authorization") or hl in (b"\r\n", b"\n"):
+                        continue
+                    cleaned.append(hl)
+                cleaned.append(b"Connection: close\r\n\r\n")
+                upstream_writer.write(b"".join(cleaned))
                 await upstream_writer.drain()
 
                 async def pipe_http(r, w):

@@ -28,6 +28,7 @@ from ocular.pipeline.segmenter import MetaSAMSegmenter, MockSAMSegmenter, export
 from ocular.pipeline.state_graph import DAGBuilder, render_rich_dag_tree
 from ocular.pipeline.video_ingest import VideoIngestSampler
 from ocular.recorder import OcularSessionRecorder
+from ocular.compiler import discover_recording_assets
 
 console = Console()
 logger = logging.getLogger("ocular.cli")
@@ -81,7 +82,6 @@ def compile_command(
 ) -> int:
     """Executes the complete offline visual compilation pipeline with structured logging."""
     t_start = time.perf_counter()
-    video_file = Path(input_path)
     output_path = Path(out_dir)
 
     print_banner(console)
@@ -97,14 +97,21 @@ def compile_command(
         )
     )
 
+    try:
+        video_file, telem_file = discover_recording_assets(input_path, telemetry_path)
+    except FileNotFoundError as fnf_err:
+        console.print(f"[bold red][!] Error:[/bold red] {escape(str(fnf_err))}")
+        return 1
+
+    if video_file.resolve() != Path(input_path).resolve():
+        console.print(
+            f"    [green]✓[/green] Resolved recording: [cyan]{escape(video_file.name)}[/cyan] "
+            f"from [yellow]{escape(str(input_path))}[/yellow]"
+        )
+
     # Ingest telemetry event stream if available
-    telem_file = (
-        Path(telemetry_path)
-        if telemetry_path
-        else video_file.parent / "telemetry_events.jsonl"
-    )
     telemetry_events: list = []
-    if telem_file.exists():
+    if telem_file and telem_file.exists():
         telemetry_events = OcularSessionRecorder.load_telemetry_events(telem_file)
         clicks_count = sum(
             1
@@ -118,6 +125,11 @@ def compile_command(
 
     # Derive workflow name dynamically from session metadata, path, or explicit parameter
     meta_file = video_file.parent / "session_metadata.json"
+    if not meta_file.exists() and Path(input_path).is_dir():
+        alt_meta = Path(input_path) / "session_metadata.json"
+        if alt_meta.exists():
+            meta_file = alt_meta
+
     origin_url = target_url
     if not origin_url and meta_file.exists():
         try:
@@ -364,6 +376,7 @@ def record_cli(
     out_dir: str = typer.Option(
         "./recordings",
         "--out-dir",
+        "--output",
         "-o",
         help="Target output directory for recorded video and telemetry_events.jsonl",
     ),
@@ -391,11 +404,12 @@ def compile_cli(
         ...,
         "--input",
         "-i",
-        help="Path to screen recording video (e.g. fixtures/sample_session.mp4)",
+        help="Path to screen recording video or session directory (e.g. fixtures/sample_session.mp4 or recordings/)",
     ),
     out_dir: str = typer.Option(
         "./dist",
         "--out-dir",
+        "--output",
         "-o",
         help="Target output directory for emitted code artifacts",
     ),

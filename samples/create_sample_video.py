@@ -17,6 +17,12 @@ def generate_synthetic_screen_recording(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    if output_path.suffix.lower() == ".webm":
+        temp_mp4 = output_path.with_name(f".tmp_{output_path.stem}.mp4")
+        generate_synthetic_screen_recording(temp_mp4, fps=fps, width=width, height=height)
+        temp_mp4.replace(output_path)
+        return output_path
+
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
 

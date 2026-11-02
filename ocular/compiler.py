@@ -7,7 +7,7 @@ the modular stages: Ingest -> SAM 3.1 Segmentation -> Muse DAG Synthesis -> Code
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Callable, Dict, Any, List
+from typing import Optional, Callable, Dict, Any, List, Tuple, Union
 import numpy as np
 
 from ocular.models.types import (
@@ -22,6 +22,80 @@ from ocular.pipeline.segmenter import BaseSegmenter, MockSAMSegmenter
 from ocular.pipeline.state_graph import BaseSynthesizer, MockMuseSynthesizer
 from ocular.pipeline.code_generator import CodeGenerator, derive_workflow_name_from_url
 from ocular.recorder import OcularSessionRecorder
+
+
+def discover_recording_assets(
+    input_path: Union[str, Path],
+    telemetry_path: Optional[Union[str, Path]] = None,
+) -> Tuple[Path, Optional[Path]]:
+    """Resolves video file and telemetry stream from an exact file path or session directory.
+
+    If input_path is a directory:
+      - Automatically searches for .webm and .mp4 video recordings (including Playwright page@*.webm patterns).
+      - If multiple video files are found, selects the newest file by modification timestamp (st_mtime).
+      - Automatically discovers sibling telemetry_events.jsonl within that directory unless telemetry_path is explicitly provided.
+
+    If input_path is an exact file:
+      - Retains existing behavior.
+      - Discovers sibling telemetry_events.jsonl unless telemetry_path is explicitly provided.
+
+    Returns:
+      (resolved_video_file_path, resolved_telemetry_file_path)
+
+    Raises:
+      FileNotFoundError: If input path does not exist or target directory contains no video recordings.
+    """
+    path = Path(input_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Input path not found: {path}")
+
+    if path.is_file():
+        video_file = path
+        telem_file = (
+            Path(telemetry_path)
+            if telemetry_path
+            else (path.parent / "telemetry_events.jsonl")
+        )
+        return video_file, (telem_file if telem_file.exists() else None)
+
+    if path.is_dir():
+        # Search direct children first
+        videos = [
+            f for f in path.iterdir()
+            if f.is_file() and f.suffix.lower() in (".webm", ".mp4")
+        ]
+        # If not found directly, search recursively for nested session directories
+        if not videos:
+            videos = [
+                f for f in path.rglob("*")
+                if f.is_file() and f.suffix.lower() in (".webm", ".mp4")
+            ]
+
+        if not videos:
+            raise FileNotFoundError(
+                f"No video recording (.webm or .mp4) found in directory: {path}"
+            )
+
+        # Sort by modification time descending (newest first)
+        videos.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        video_file = videos[0]
+
+        if telemetry_path:
+            telem_candidate = Path(telemetry_path)
+            telem_file = telem_candidate if telem_candidate.exists() else None
+        else:
+            adjacent_telem = video_file.parent / "telemetry_events.jsonl"
+            dir_telem = path / "telemetry_events.jsonl"
+            if adjacent_telem.exists():
+                telem_file = adjacent_telem
+            elif dir_telem.exists():
+                telem_file = dir_telem
+            else:
+                telem_file = None
+
+        return video_file, telem_file
+
+    raise FileNotFoundError(f"Input path is neither a file nor a directory: {path}")
 
 
 class OcularCompiler:
@@ -55,19 +129,14 @@ class OcularCompiler:
         target_url: Optional[str] = None,
     ) -> CompiledArtifacts:
         """Compiles an MP4 video recording into executable Playwright + FastAPI artifacts."""
-        video_path = Path(video_path)
         output_dir = Path(output_dir)
+        video_file, resolved_telem = discover_recording_assets(video_path, telemetry_path)
+        video_path = video_file
 
         # Ingest telemetry if specified or co-located with video file
         loaded_events: List[Dict[str, Any]] = list(telemetry_events or [])
-        if not loaded_events:
-            effective_telem_path = (
-                Path(telemetry_path)
-                if telemetry_path
-                else video_path.parent / "telemetry_events.jsonl"
-            )
-            if effective_telem_path.exists():
-                loaded_events = OcularSessionRecorder.load_telemetry_events(effective_telem_path)
+        if not loaded_events and resolved_telem and resolved_telem.exists():
+            loaded_events = OcularSessionRecorder.load_telemetry_events(resolved_telem)
 
         if loaded_events:
             self._notify(

@@ -411,10 +411,25 @@ class OcularSessionRecorder:
             if parsed.scheme in ("http", "https") and parsed.hostname:
                 host = parsed.hostname.lower()
                 port = f":{parsed.port}" if parsed.port and parsed.port not in (80, 443) else ""
-                return f"{parsed.scheme.lower()}://{host}{port}"
+                # Keep the START PATH: compiled steps only exist on e.g. /chart/AAPL, not the site root.
+                # Credentials, query string and fragment (where tokens live) are still dropped.
+                path = parsed.path.rstrip("/")
+                return f"{parsed.scheme.lower()}://{host}{port}{path}"
         except Exception:
             pass
         return url
+
+    @staticmethod
+    def _origin_only(url: str) -> str:
+        try:
+            from urllib.parse import urlparse
+            p = urlparse(url.strip())
+            if p.scheme in ("http", "https") and p.hostname:
+                port = f":{p.port}" if p.port and p.port not in (80, 443) else ""
+                return f"{p.scheme.lower()}://{p.hostname.lower()}{port}"
+        except Exception:
+            pass
+        return ""
 
     def _write_session_metadata(self, url: str) -> None:
         start_epoch_ms = int(time.time() * 1000)
@@ -435,7 +450,7 @@ class OcularSessionRecorder:
             with open(fd, "w", encoding="utf-8", closefd=True) as f:
                 f.write(json.dumps({
                     "url": sanitized,
-                    "origin": sanitized,
+                    "origin": self._origin_only(url),
                     "timestamp": time.time(),
                     "start_timestamp_ms": start_epoch_ms,
                 }))
@@ -545,6 +560,14 @@ class OcularSessionRecorder:
                 await context.close()
                 raw_video_path = await video.path()
                 self.video_path = Path(raw_video_path)
+                try:
+                    if self.video_path.exists():
+                        clean_video_path = self.out_dir / "recording.webm"
+                        if clean_video_path.resolve() != self.video_path.resolve():
+                            self.video_path.replace(clean_video_path)
+                            self.video_path = clean_video_path
+                except Exception as rename_err:
+                    logger.debug(f"Could not rename video to recording.webm: {rename_err}")
             else:
                 await context.close()
 
