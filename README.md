@@ -9,23 +9,23 @@
   ╚═════╝  ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝
 ```
 
-**Offline Visual Workflow Compiler**  
+**Ahead-of-Time Visual Web Compiler**  
 *Built for the Meta Global AI Developer Hackathon 2026*
 
-[![Tests](https://img.shields.io/badge/tests-133%2F133%20passing-success)](#)
-[![Latency](https://img.shields.io/badge/latency-~146ms-blue)](#)
-[![Cost](https://img.shields.io/badge/runtime%20vision%20cost-$0.00-green)](#)
+[![Tests](https://img.shields.io/badge/tests-145%2F145%20passing-brightgreen)](#)
+[![Runtime Cost](https://img.shields.io/badge/runtime%20vision%20cost-%240.00-green)](#)
 [![Meta](https://img.shields.io/badge/Powered%20By-Meta%20SAM%203.1%20%7C%20Muse%20Spark-0668E1)](#)
+[![Security](https://img.shields.io/badge/Security-SSRF%20Egress%20Guarded-red)](#)
 
 </div>
 
 ## The Paradigm Shift: Ahead-of-Time Visual Compilation
 
-Traditional Multimodal Vision Agents are fragile, slow, and expensive. Taking screenshots, transmitting base64 payloads, and waiting for LLM spatial reasoning at runtime results in 12,000ms+ latencies, stochastic hallucinations, and high API costs per action.
+Traditional Multimodal Vision Agents are fragile, slow, and expensive. Taking screenshots, transmitting base64 payloads, and waiting for LLM spatial reasoning at runtime results in high latencies, stochastic hallucinations, and continuous API costs per action.
 
-**Ocular** shifts foundation models to compile-time. It digests human screen recordings (MP4) and uses **Meta SAM 3.1** and **Meta Muse Spark** to synthesize a deterministic Directed Acyclic Graph (DAG). It then emits a zero-inference Playwright execution driver wrapped in a typed FastAPI microservice.
+**Ocular** shifts foundation models to compile-time. It digests human screen interactions and uses **Meta SAM 3.1** and **Meta Muse Spark** to synthesize a deterministic Directed Acyclic Graph (DAG)[cite: 8, 9]. It then emits a zero-runtime-inference Playwright execution driver wrapped in an authenticated FastAPI microservice[cite: 8].
 
-**The result: ~146ms execution latency, $0.00 runtime vision cost, and 100% deterministic reliability.**
+**The result: $0.00 runtime vision cost, sub-second deterministic execution, and complete isolation from runtime LLM dependencies[cite: 8, 9].**
 
 ---
 
@@ -33,17 +33,20 @@ Traditional Multimodal Vision Agents are fragile, slow, and expensive. Taking sc
 
 ### 1. Dual-Tier Hybrid Resilience
 Ocular drivers do not rely blindly on absolute pixels. The compiler emits a resilient execution matrix:
-* **Tier 1 (Semantic Accessibility):** Primary execution binds natively to the DOM using ARIA roles (`page.get_by_role`), making the driver immune to CSS layout refactors and responsive UI shifts.
-* **Tier 2 (Meta SAM 3.1 Visual Fallback):** If an element is obfuscated by shadow DOMs, virtualized trees, or rendered inside an HTML5 `<canvas>` (e.g., WebGL charts), the driver catches the DOM exception and seamlessly translates SAM 3.1 scale-invariant coordinates into exact viewport clicks.
+- **Tier 1 (Semantic Accessibility):** Primary execution binds natively to the DOM using ARIA roles (`page.get_by_role`), making the driver immune to CSS layout refactors and responsive UI shifts.
+- **Tier 2 (Meta SAM 3.1 Visual Fallback):** If an element is obfuscated by shadow DOMs, virtualized trees, or rendered inside an HTML5 `<canvas>` (e.g., WebGL charts), the driver catches the DOM exception and seamlessly translates SAM 3.1 scale-invariant coordinates into exact viewport clicks.
 
-### 2. Dynamic Parameterization & Type Synthesis
-Ocular is not a static macro recorder. During Stage 3, **Meta Muse Spark** actively infers workflow variables (like search queries or chart intervals) from the visual recording. 
-* Synthesizes a strict JSON schema embedded directly in the DAG.
-* Code-generates a typed `Pydantic v2` payload (`ExecutionPayload`).
-* Binds it dynamically to a generated `FastAPI` route, exposing an interactive Swagger UI for the workflow automatically.
+### 2. In-Process Egress Confinement (`netguard.py`)
+Autonomous tools risk data exfiltration and Server-Side Request Forgery (SSRF). Ocular automatically wraps emitted Playwright browser contexts in an in-process proxy firewall (`netguard.py`) that strictly enforces allowed domains, isolates metadata, and prevents unauthorized route traversal.
 
-### 3. Zero-Runtime Cost (ZRC)
-Because spatial segmentation and state-transition logic are computed once during compilation, the emitted microservice runs entirely offline via Playwright. Zero runtime API calls mean zero token egress and zero ongoing cost.
+### 3. Dynamic Parameterization & Sensitive Data Redaction
+- Synthesizes a strict JSON schema embedded directly in the DAG.
+- Code-generates a typed `Pydantic v2` payload (`ExecutionPayload`).
+- Masks sensitive parameter values (`password`, `token`, `secret`, `key`) with `[REDACTED]` across execution logs and trace exceptions.
+- Binds routes dynamically to FastAPI, exposing interactive schema documentation for authenticated workflow triggers.
+
+### 4. Zero-Runtime Cost (ZRC)
+Because spatial segmentation and state-transition logic are computed once during compilation, the emitted microservice runs entirely offline via Playwright[cite: 8]. Zero runtime model inference means zero token egress and zero ongoing cost[cite: 8, 9].
 
 ---
 
@@ -62,12 +65,12 @@ flowchart TD
         Video & TelemFile --> Stage1["Stage 1: Ingest & Differencing\n(Temporal alignment & keyframe extraction)"]
         Stage1 --> Stage2["Stage 2: Meta SAM 3.1 Segmentation\n(Click events as point-prompt priors)"]
         Stage2 --> Stage3["Stage 3: Meta Muse Spark DAG Synthesis\n(State transitions, parameters & schema)"]
-        Stage3 --> Stage4["Stage 4: Jinja2 Artifact Generator"]
+        Stage3 --> Stage4["Stage 4: Jinja2 Artifact Generator\n(Generates Playwright driver + NetGuard proxy)"]
     end
 
     subgraph Emitted["3. Zero-Inference Production Runtime"]
         Stage4 --> Driver["Playwright Hybrid Driver\n(Semantic ARIA + SAM coordinate fallback)"]
-        Stage4 --> API["FastAPI Microservice + Swagger UI\n(~146ms latency, $0.00 runtime vision cost)"]
+        Stage4 --> API["FastAPI Microservice + NetGuard Egress\n(Authenticated Replay, $0.00 runtime vision cost)"]
     end
 ```
 
@@ -83,8 +86,30 @@ flowchart TD
    **Meta SAM 3.1** evaluates the frames using recorded click events as point-prompt priors, synthesizing scale-invariant visual masks (`[0.0, 1.0]`) for all interactive elements.
 4. **Stage 3: DAG Synthesis (`inference.baseten.co`)**
    **Meta Muse Spark** evaluates state transitions, infers structural logic, extracts parameters, and compiles the verified state graph.
-5. **Stage 4: Artifact Generation**
-   Jinja2 templates emit the final production artifacts: `playwright_driver.py`, `app.py`, `main.py`, and typed `Pydantic` schemas.
+5. **Stage 4: Hardened Artifact Generation**
+   Jinja2 templates emit the production artifacts: `playwright_driver.py`, `app.py`, `netguard.py`, `workflow.json`, and typed schemas.
+
+---
+
+## Verified Driver Execution Telemetry
+
+```text
+================================================================================
+                         Ocular Driver Execution Telemetry                      
+================================================================================
+  Telemetry Metric       │ Value / Status                                       
+─────────────────────────┼──────────────────────────────────────────────────────
+  Workflow Class         │ TradingviewWorkflow                                  
+  Execution Strategy     │ Semantic Accessibility (Roles / Locators)            
+  Browser Mode           │ Visible (Headed)                                     
+  Target Anchor          │ div.js-button-text_text-zm3YRUFG                     
+  Steps Executed         │ 2                                                    
+  Runtime Inference Cost │ $0.00 (Zero Runtime Vision)                          
+  Compile Hash           │ 81d99c65bf6691b1                                     
+  Landed URL             │ [https://www.tradingview.com/chart/](https://www.tradingview.com/chart/)                   
+  Execution Status       │ ✓ PASSED                                             
+================================================================================
+```
 
 ---
 
@@ -92,39 +117,56 @@ flowchart TD
 
 **Prerequisites:** Python 3.11+ and Playwright installed.
 
-### 1. Record an Interactive Browser Session
-Launch the interactive session recorder targeting any web application:
+### 1. Setup Environment
 ```bash
-python -m ocular record --url http://localhost:3000 --out-dir ./recordings
+git clone [https://github.com/japanchicken898-droid/Ocular.git](https://github.com/japanchicken898-droid/Ocular.git)
+cd Ocular
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+playwright install chromium
 ```
-*An interactive browser window opens with client-side telemetry probes injected. Interact with the target application (clicking buttons, entering inputs) and close the browser window when finished. Ocular saves the high-resolution video and `telemetry_events.jsonl` stream.*
 
-### 2. Compile a Visual Workflow
-Pass the recorded session into the Ocular compiler:
+### 2. Execute Pre-Compiled Workflow (Headed)
+Run the emitted Playwright driver directly against TradingView[cite: 8]:
 ```bash
-python -m ocular compile --input ./recordings/session.webm --out-dir ./dist
+python dist_tradingview/playwright_driver.py --headed
 ```
-*If a `telemetry_events.jsonl` file is co-located in the input directory, Ocular automatically ingests it as point-prompt priors for SAM 3.1 and transition boundaries for Muse Spark. Alternatively, supply it explicitly with `--telemetry <path>`.*
+*The driver executes the compiled interaction, verifies postconditions, and outputs the telemetry card confirming `$0.00` runtime inference cost[cite: 8, 9].*
 
-### 3. Execute the Emitted Driver (Headless)
-Run the emitted Playwright driver directly, injecting dynamic parameters on the fly:
+### 3. Launch the Emitted FastAPI Microservice
+Start the auto-generated, egress-guarded REST API server[cite: 8]:
 ```bash
-python dist/playwright_driver.py --params '{"interval": "1h"}'
+export OCULAR_ENABLE_DOCS=1
+export OCULAR_API_KEY="ocular-demo-key-2026"
+uvicorn dist_tradingview.app:app --port 8000
 ```
-*The CLI will output a Rich telemetry dashboard confirming execution strategy (Semantic vs. SAM Visual), target anchor resolution, and sub-200ms latency.*
 
-### 4. Launch the Emitted FastAPI Microservice
-Start the auto-generated REST API server:
-```bash
-uvicorn dist.main:app --reload
-```
-Navigate to `http://127.0.0.1:8000/docs` to interact with the auto-generated Swagger documentation and execute your compiled visual workflow via POST request.
 
 ---
 
-## Test Suite
+## Recording & Compiling New Workflows
 
-Ocular includes a comprehensive pytest suite covering DAG synthesis, hybrid driver resilience, dynamic parameter injection, and fallback mechanics.
+### 1. Record an Interactive Browser Session
+Launch the interactive session recorder targeting any web application[cite: 8]:
+```bash
+ocular record --url "The website url"
+```
+*An interactive browser window opens with client-side telemetry probes injected. Interact with the target application and close the browser window when finished. Ocular saves the high-resolution video and telemetry stream to `./recordings`.*
+
+### 2. Compile a Visual Workflow
+Pass the recorded session into the Ocular compiler using Meta's vision stack[cite: 8, 9]:
+```bash
+export OCULAR_ALLOW_EXTERNAL_INFERENCE=1
+ocular compile -i recordings/ --output dist_tradingview
+```
+*Meta SAM 3.1 resolves spatial segmentation across canvas and non-DOM boundaries, and Meta Muse Spark compiles verified state transitions into `dist_tradingview/`[cite: 8, 9].*
+
+---
+
+## Confinement & Test Suite
+
+Ocular includes a 145-test confinement suite covering DAG synthesis, hybrid driver resilience, dynamic parameter injection, SSRF egress filtering, and secret redaction[cite: 6, 8].
 
 ```bash
 pytest
