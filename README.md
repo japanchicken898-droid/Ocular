@@ -94,21 +94,22 @@ flowchart TD
 ## Verified Driver Execution Telemetry
 
 ```text
-================================================================================
-                         Ocular Driver Execution Telemetry                      
-================================================================================
-  Telemetry Metric       │ Value / Status                                       
-─────────────────────────┼──────────────────────────────────────────────────────
-  Workflow Class         │ TradingviewWorkflow                                  
-  Execution Strategy     │ Semantic Accessibility (Roles / Locators)            
-  Browser Mode           │ Visible (Headed)                                     
-  Target Anchor          │ div.js-button-text_text-zm3YRUFG                     
-  Steps Executed         │ 2                                                    
-  Runtime Inference Cost │ $0.00 (Zero Runtime Vision)                          
-  Compile Hash           │ 81d99c65bf6691b1                                     
-  Landed URL             │ [https://www.tradingview.com/chart/](https://www.tradingview.com/chart/)                   
-  Execution Status       │ ✓ PASSED                                             
-================================================================================
+┌─────────────────────────┬─────────────────────────────────────────────────────────────┐
+│ Ocular Driver Execution Telemetry                                                     │
+├─────────────────────────┼─────────────────────────────────────────────────────────────┤
+│ Telemetry Metric        │ Value / Status                                              │
+├─────────────────────────┼─────────────────────────────────────────────────────────────┤
+│ Workflow Class          │ TradingviewWorkflow                                         │
+│ Execution Strategy      │ Meta SAM 3.1 Visual Coordinates                             │
+│ Browser Mode            │ Visible (Headed)                                            │
+│ Target Anchor           │ canvas_chart_viewport                                       │
+│ Steps Executed          │ 2                                                           │
+│ End-to-End Latency      │ 11270.47 ms                                                 │
+│ Runtime Inference Cost  │ $0.00 (Zero Runtime Vision)                                 │
+│ Compile Hash            │ 81d99c65bf6691b1                                            │
+│ Landed URL              │ [https://www.tradingview.com/chart/](https://www.tradingview.com/chart/)                          │
+│ Execution Status        │ ✓ PASSED                                                    │
+└─────────────────────────┴─────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -137,7 +138,6 @@ python dist_tradingview/playwright_driver.py --headed
 ### 3. Launch the Emitted FastAPI Microservice
 Start the auto-generated, egress-guarded REST API server:
 ```bash
-export OCULAR_ENABLE_DOCS=1
 export OCULAR_API_KEY="ocular-demo-key-2026"
 uvicorn dist_tradingview.app:app --port 8000
 ```
